@@ -9,6 +9,8 @@ import xlsxwriter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
 from functools import lru_cache
+import re
+from difflib import SequenceMatcher
 
 # Cache temizleme fonksiyonu
 def clear_all_caches():
@@ -29,17 +31,111 @@ def clear_all_caches():
         st.error(f"Cache temizleme hatası: {str(e)}")
         return False
 
+# Ürün kodu eşleştirme yardımcı fonksiyonları
+def clean_product_code(code):
+    """Ürün kodunu temizle ve standardize et"""
+    if pd.isna(code) or code == '':
+        return ''
+    
+    # String'e çevir
+    code_str = str(code).strip()
+    
+    # Boşlukları kaldır
+    code_str = code_str.replace(' ', '').replace('-', '').replace('_', '')
+    
+    # Büyük harfe çevir
+    code_str = code_str.upper()
+    
+    # Özel karakterleri temizle (sadece harf, rakam ve nokta bırak)
+    import re
+    code_str = re.sub(r'[^A-Z0-9.]', '', code_str)
+    
+    return code_str
+
+def find_best_match(product_code, target_codes, threshold=0.8):
+    """En iyi eşleşmeyi bul (fuzzy matching)"""
+    from difflib import SequenceMatcher
+    
+    if not product_code:
+        return None, 0
+    
+    best_match = None
+    best_ratio = 0
+    
+    for target_code in target_codes:
+        if pd.isna(target_code):
+            continue
+            
+        target_str = str(target_code).strip()
+        
+        # Tam eşleşme kontrolü
+        if clean_product_code(product_code) == clean_product_code(target_str):
+            return target_code, 1.0
+        
+        # Fuzzy matching
+        ratio = SequenceMatcher(None, clean_product_code(product_code), clean_product_code(target_str)).ratio()
+        
+        if ratio > best_ratio and ratio >= threshold:
+            best_ratio = ratio
+            best_match = target_code
+    
+    return best_match, best_ratio
+
+def process_schaeffler_codes(catalogue_number):
+    """Schaeffler ürün kodlarını işle"""
+    if pd.isna(catalogue_number):
+        return ''
+    
+    code_str = str(catalogue_number).strip()
+    
+    # Özel Schaeffler kuralları
+    # 1. Sondaki 0'ları kaldır (sadece belirli durumlarda)
+    if code_str.endswith('0') and len(code_str) > 1:
+        # Eğer sondaki 0'dan önceki karakter rakam değilse, 0'ı kaldır
+        if not code_str[-2].isdigit():
+            code_str = code_str[:-1]
+    
+    # 2. Özel Schaeffler formatları
+    # LUK formatı: LUK-XXXXX -> XXXXX
+    if code_str.startswith('LUK-'):
+        code_str = code_str[4:]
+    
+    # 3. Boşlukları ve özel karakterleri temizle
+    code_str = clean_product_code(code_str)
+    
+    return code_str
+
+def process_valeo_codes(valeo_ref):
+    """Valeo ürün kodlarını işle"""
+    if pd.isna(valeo_ref):
+        return ''
+    
+    code_str = str(valeo_ref).strip()
+    
+    # Özel Valeo kuralları
+    # 1. Valeo özel formatları
+    # VALE-XXXXX -> XXXXX
+    if code_str.startswith('VALE-'):
+        code_str = code_str[5:]
+    
+    # 2. Boşlukları ve özel karakterleri temizle
+    code_str = clean_product_code(code_str)
+    
+    return code_str
+
 # Sayfa ayarları
 st.set_page_config(
-    page_title="Excel Dönüştürme Aracı (Ultra Hızlı)",
+    page_title="Sipariş Çalışması :)",
     page_icon="⚡",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
 # Başlık
-st.title("⚡ Ultra Hızlı Excel Dönüştürücü")
+st.title("Sipariş Çalışması")
 st.caption("100.000+ satırlık dosyalar için optimize edilmiş versiyon - Maksimum Hız Modu")
+
+# Uygulama başlangıç mesajı kaldırıldı - daha temiz arayüz
 
 # Global değişkenler
 if 'processed_data' not in st.session_state:
@@ -146,44 +242,92 @@ def transform_data_ultra_fast(df):
             'A01-': 'ANKARA'
         }
         
+        # Debug: Show available columns for İKİTELLİ
+        ikitelli_related_cols = [col for col in df_filtered.columns if any(keyword in col.upper() for keyword in ['İKİTELLİ', 'IKITELLI', 'TD-E01', 'E01', 'IKI'])]
+        if ikitelli_related_cols:
+            pass
+        else:
+            st.warning("⚠️ İKİTELLİ ile ilgili kolon bulunamadı!")
+            st.info(f"🔍 Mevcut tüm kolonlar: {list(df_filtered.columns)}")
+        
         for old_prefix, new_name in depo_mapping.items():
             for col_type, new_type in zip(['DEVIR', 'ALIS', 'SATIS', 'STOK'],
                                          ['DEVIR', 'ALIŞ', 'SATIS', 'STOK']):
                 old_col = f"{old_prefix}{col_type}"
                 if old_col in df_filtered.columns:
-                    # Vektörel işlem
+                    # Vektörel işlem - boş satırlara 0 değeri ata
                     col_data = df_filtered[old_col].fillna(0)
                     if pd.api.types.is_numeric_dtype(col_data):
                         col_data = col_data.astype(float)
-                        col_data = col_data.replace(0, '-')
                     else:
                         col_data = col_data.astype(str)
                     new_df[f"{new_name} {new_type}"] = col_data.astype('string')
                 else:
-                    # Eksik sütun için boş değer
-                    new_df[f"{new_name} {new_type}"] = '-'
+                    # Eksik sütun için 0 değeri
+                    new_df[f"{new_name} {new_type}"] = '0'
+                    # Debug: Show which columns are missing
+                    if new_name == 'İKİTELLİ':
+                        st.warning(f"⚠️ İKİTELLİ kolonu bulunamadı: {old_col}")
+        
+        # İKİTELLİ için alternatif kolon arama - daha esnek yaklaşım
+        if 'İKİTELLİ DEVIR' in new_df.columns and new_df['İKİTELLİ DEVIR'].iloc[0] == '0':
+            st.info("🔍 İKİTELLİ kolonları için alternatif arama yapılıyor...")
+            
+            # Farklı kolon isimlendirme kalıplarını dene
+            alternative_patterns = [
+                'IKITELLI', 'IKI', 'IKIT', 'IKITELLI', 'IKITELLİ',
+                'TD-E01', 'E01', 'TD-E', 'E-', 'TD-', 'E-01'
+            ]
+            
+            for pattern in alternative_patterns:
+                pattern_cols = [col for col in df_filtered.columns if pattern.upper() in col.upper()]
+                if pattern_cols:
+                    # Pattern ile bulunan kolonlar - debug mesajları kaldırıldı
+                    
+                    # Bu kolonları İKİTELLİ kolonlarına eşleştirmeye çalış
+                    for col in pattern_cols:
+                        col_upper = col.upper()
+                        if 'DEVIR' in col_upper or 'DEVİR' in col_upper:
+                            col_data = df_filtered[col].fillna(0)
+                            new_df['İKİTELLİ DEVIR'] = col_data.astype('string')
+                            st.success(f"✅ İKİTELLİ DEVIR için {col} kullanıldı")
+                        elif 'ALIS' in col_upper or 'ALIŞ' in col_upper:
+                            col_data = df_filtered[col].fillna(0)
+                            new_df['İKİTELLİ ALIŞ'] = col_data.astype('string')
+                            st.success(f"✅ İKİTELLİ ALIŞ için {col} kullanıldı")
+                        elif 'SATIS' in col_upper or 'SATIŞ' in col_upper:
+                            col_data = df_filtered[col].fillna(0)
+                            new_df['İKİTELLİ SATIS'] = col_data.astype('string')
+                            st.success(f"✅ İKİTELLİ SATIS için {col} kullanıldı")
+                        elif 'STOK' in col_upper:
+                            col_data = df_filtered[col].fillna(0)
+                            new_df['İKİTELLİ STOK'] = col_data.astype('string')
+                            st.success(f"✅ İKİTELLİ STOK için {col} kullanıldı")
         
         # 10. Tedarikçi bakiye kolonları - vektörel
         tedarikci_cols = [
             'İmes Tedarikçi Bakiye', 'Ankara Tedarikçi Bakiye', 
-            'Bolu Tedarikçi Bakiye', 'Maslak Tedarikçi Bakiye'
+            'Bolu Tedarikçi Bakiye', 'Maslak Tedarikçi Bakiye', 'İkitelli Tedarikçi Bakiye'
         ]
         
         for col in tedarikci_cols:
-            new_df[col] = '-'
+            new_df[col] = '0'
         
-        # 11. Dinamik ay başlıkları - vektörel
+        # 11. Dinamik ay başlıkları - önümüzdeki 2 ay
         current_month = datetime.datetime.now().month
         months = ['Ocak', 'Şubat', 'Mart', 'Nisan', 'Mayıs', 'Haziran',
                  'Temmuz', 'Ağustos', 'Eylül', 'Ekim', 'Kasım', 'Aralık']
         
-        next_month1 = months[(current_month) % 12]
-        next_month2 = months[(current_month + 1) % 12]
+        # Önümüzdeki 2 ay hesaplama
+        first_next_month_name = months[current_month % 12]      # Gelecek ay (bir sonraki ay)
+        second_next_month_name = months[(current_month + 1) % 12]  # İkinci gelecek ay
         
-        # Vektörel ay başlıkları
+        # Ay bilgilerini hesapla - debug mesajları kaldırıldı
+        
+        # Vektörel ay başlıkları - önümüzdeki 2 ay
         for i in range(5):
-            new_df[f'{next_month1}_{i+1}'] = 0
-            new_df[f'{next_month2}_{i+1}'] = 0
+            new_df[f'{first_next_month_name}_{i+1}'] = 0
+            new_df[f'{second_next_month_name}_{i+1}'] = 0
         
         # 12. Diğer sütunlar - vektörel
         other_cols = {
@@ -246,33 +390,39 @@ def transform_data_ultra_fast(df):
         new_df['İkitelli Sipariş'] = 0
         
         # Sütun sıralamasını düzelt - verilen sıraya göre (64 adet)
+        # Dinamik ay başlıkları oluştur
+        dynamic_month_cols = []
+        for i in range(1, 6):  # 1'den 5'e kadar
+            dynamic_month_cols.append(f'{first_next_month_name}_{i}')
+            dynamic_month_cols.append(f'{second_next_month_name}_{i}')
+        
         desired_order = [
             'URUNKODU', 'Düzenlenmiş Ürün Kodu', 'ACIKLAMA', 'URETİCİKODU', 'ORJİNAL', 'ESKİKOD',
             'CAT1', 'CAT2', 'CAT3', 'CAT4', 'CAT5', 'CAT6', 'CAT7',
-            # Depo kolonları (sıralama: MASLAK, İMES, İKİTELLİ, BOLU, ANKARA)
-            'MASLAK DEVIR', 'MASLAK ALIŞ', 'MASLAK SATIS', 'MASLAK STOK',
+            # Depo kolonları (sıralama: İMES, İKİTELLİ, ANKARA, MASLAK, BOLU)
             'İMES DEVIR', 'İMES ALIŞ', 'İMES SATIS', 'İMES STOK',
             'İKİTELLİ DEVIR', 'İKİTELLİ ALIŞ', 'İKİTELLİ SATIS', 'İKİTELLİ STOK',
-            'BOLU DEVIR', 'BOLU ALIŞ', 'BOLU SATIS', 'BOLU STOK',
             'ANKARA DEVIR', 'ANKARA ALIŞ', 'ANKARA SATIS', 'ANKARA STOK',
-            # no2
+            'MASLAK DEVIR', 'MASLAK ALIŞ', 'MASLAK SATIS', 'MASLAK STOK',
+            'BOLU DEVIR', 'BOLU ALIŞ', 'BOLU SATIS', 'BOLU STOK',
+            # not
             'not',
-            # Depo Bakiye kolonları
-            'Maslak Depo Bakiye', 'Bolu Depo Bakiye', 'İmes Depo Bakiye', 'Ankara Depo Bakiye', 'İkitelli Depo Bakiye',
+            # Depo Bakiye kolonları (sıralama: İmes, İkitelli, Ankara, Maslak, Bolu)
+            'İmes Depo Bakiye', 'İkitelli Depo Bakiye', 'Ankara Depo Bakiye', 'Maslak Depo Bakiye', 'Bolu Depo Bakiye',
             # Kampanya Tipi
             'Kampanya Tipi',
             # Toplam İsk
             'Toplam İsk',
             # Toplam Depo Bakiye
             'Toplam Depo Bakiye',
-            # Tedarikçi bakiye kolonları
-            'Maslak Tedarikçi Bakiye', 'Bolu Tedarikçi Bakiye', 'İmes Tedarikçi Bakiye', 'Ankara Tedarikçi Bakiye', 'İkitelli Tedarikçi Bakiye',
+            # Tedarikçi bakiye kolonları (sıralama: İmes, İkitelli, Ankara, Maslak, Bolu)
+            'İmes Tedarikçi Bakiye', 'İkitelli Tedarikçi Bakiye', 'Ankara Tedarikçi Bakiye', 'Maslak Tedarikçi Bakiye', 'Bolu Tedarikçi Bakiye',
             # Paket Adetleri
             'Paket Adetleri',
-            # Sipariş kolonları
-            'Maslak Sipariş', 'Bolu Sipariş', 'İmes Sipariş', 'Ankara Sipariş', 'İkitelli Sipariş',
-            # Ay başlıkları
-            'Ağustos_1', 'Eylül_1', 'Ağustos_2', 'Eylül_2', 'Ağustos_3', 'Eylül_3', 'Ağustos_4', 'Eylül_4', 'Ağustos_5', 'Eylül_5',
+            # Sipariş kolonları (sıralama: İmes, İkitelli, Ankara, Maslak, Bolu)
+            'İmes Sipariş', 'İkitelli Sipariş', 'Ankara Sipariş', 'Maslak Sipariş', 'Bolu Sipariş',
+            # Dinamik ay başlıkları
+        ] + dynamic_month_cols + [
             # Diğer sütunlar
             'TOPL.FAT.ADT', 'MÜŞT.SAY.', 'SATıŞ FIYATı', 'DÖVIZ CINSI (S)', 'URUNKODU_3',
             # Son başlıklar
@@ -285,7 +435,7 @@ def transform_data_ultra_fast(df):
             new_df = new_df[available_cols]
         
         # Toplam Depo Bakiye hesaplama
-        depo_bakiye_cols = ['Maslak Depo Bakiye', 'Bolu Depo Bakiye', 'İmes Depo Bakiye', 'Ankara Depo Bakiye', 'İkitelli Depo Bakiye']
+        depo_bakiye_cols = ['İmes Depo Bakiye', 'İkitelli Depo Bakiye', 'Ankara Depo Bakiye', 'Maslak Depo Bakiye', 'Bolu Depo Bakiye']
         available_depo_cols = [col for col in depo_bakiye_cols if col in new_df.columns]
         
         if available_depo_cols and 'Toplam Depo Bakiye' in new_df.columns:
@@ -295,6 +445,20 @@ def transform_data_ultra_fast(df):
             
             # Toplam hesapla
             new_df['Toplam Depo Bakiye'] = new_df[available_depo_cols].sum(axis=1)
+        
+        # İKİTELLİ kolonlarının son durumunu kontrol et
+        ikitelli_cols = ['İKİTELLİ DEVIR', 'İKİTELLİ ALIŞ', 'İKİTELLİ SATIS', 'İKİTELLİ STOK']
+        empty_ikitelli_cols = []
+        for col in ikitelli_cols:
+            if col in new_df.columns:
+                if new_df[col].iloc[0] == '0' and new_df[col].nunique() == 1:
+                    empty_ikitelli_cols.append(col)
+        
+        if empty_ikitelli_cols:
+            st.warning(f"⚠️ Boş kalan İKİTELLİ kolonları: {empty_ikitelli_cols}")
+
+        else:
+            st.success("✅ İKİTELLİ kolonları başarıyla dolduruldu!")
         
         return new_df
     
@@ -309,12 +473,14 @@ def match_brands_parallel(main_df, uploaded_files):
         # Marka-Excel eşleştirme sözlüğü
         brand_excel_mapping = {
             'SCHAEFFLER LUK': 'excel1',
+            'SCHAFLERR': 'excel1',  # Schaflerr için alternatif isim
             'ZF İTHAL': 'excel2', 
             'DELPHI': 'excel3',
             'ZF YERLİ': 'excel4',
             'VALEO': 'excel5',
             'FILTRON': 'excel6',
-            'MANN': 'excel7'
+            'MANN': 'excel7',
+            'BOSCH': 'excel8'
         }
         
         # Ana DataFrame'i kopyala
@@ -342,7 +508,7 @@ def match_brands_parallel(main_df, uploaded_files):
             for future in as_completed(future_to_brand):
                 brand_name, brand_df = future.result()
                 brand_data[brand_name] = brand_df
-                st.success(f"✅ {brand_name} verisi yüklendi: {len(brand_df)} satır")
+
         
         # Her marka için işlem yap
         for brand, brand_df in brand_data.items():
@@ -350,9 +516,13 @@ def match_brands_parallel(main_df, uploaded_files):
                 # CAT4'te bu markayı ara (esnek arama)
                 search_terms = [brand]
                 
-                # Schaeffler için özel arama terimleri
-                if 'Schaeffler' in brand:
-                    search_terms.extend(['Schaeffler', 'Schaeffler Luk', 'SchaefflerLuk', 'SCHAEFFLER LUK', 'SCHAEFFLER'])
+                # Schaeffler için özel arama terimleri - CAT4'teki tam değere göre
+                if 'Schaeffler' in brand or 'Schaflerr' in brand:
+                    search_terms = ['SCHAEFFLER LUK']  # CAT4'teki tam değer
+                
+                # Delphi için özel arama terimleri - CAT4'teki tam değere göre
+                if 'DELPHI' in brand:
+                    search_terms = ['DELPHI']  # CAT4'teki tam değer
                 
                 # ZF için özel arama terimleri
                 if 'ZF' in brand:
@@ -364,7 +534,11 @@ def match_brands_parallel(main_df, uploaded_files):
                 
                 # Filtron için özel arama terimleri
                 if 'FILTRON' in brand:
-                    search_terms.extend(['FILTRON', 'FİLTRON', 'FILTRON FILTER', 'FİLTRON FİLTER'])
+                    search_terms.extend(['FILTRON'])
+                
+                # Bosch için özel arama terimleri
+                if 'BOSCH' in brand:
+                    search_terms.extend(['BOSCH', 'BOSCH REXROTH', 'BOSCH-REXROTH'])
                 
                 # Debug: Arama terimlerini göster
                 st.info(f"🔍 {brand} için arama terimleri: {search_terms}")
@@ -377,22 +551,40 @@ def match_brands_parallel(main_df, uploaded_files):
                 
                 brand_count = brand_mask.sum()
                 
-                # Debug: CAT4'teki benzersiz değerleri göster
+                # CAT4 kontrolü - debug mesajları kaldırıldı
                 if brand_count == 0:
                     unique_cat4 = main_df['CAT4'].dropna().unique()
-                    st.info(f"🔍 CAT4 kolonundaki benzersiz değerler: {list(unique_cat4[:10])}")
-                
-                if brand_count > 0:
-                    st.info(f"📊 {brand} markası {brand_count} ürün için bulundu")
+
+                    
+                    # CAT4'te tam eşleşme ara
+                    exact_matches = main_df[main_df['CAT4'] == search_terms[0]]
+                    if len(exact_matches) > 0:
+                        st.success(f"✅ Tam eşleşme bulundu: {search_terms[0]} - {len(exact_matches)} satır")
+                        brand_mask = main_df['CAT4'] == search_terms[0]
+                        brand_count = brand_mask.sum()
+                else:
+                    st.success(f"✅ {brand} markası {brand_count} ürün için bulundu")
+                    
+                    # Bulunan ürün örnekleri - debug mesajları kaldırıldı
+                    found_products = main_df[brand_mask]['CAT4'].head(5).tolist()
                     
                     # Mann ve Filtron için normal işlem (CAT4'te bulundu)
                     if ('MANN' in brand or 'FILTRON' in brand) and brand_count > 0:
-                        st.info(f"🔄 {brand} için normal işlem yapılıyor (CAT4'te bulundu)...")
-                        # Burada normal işlem yapılacak (Schaeffler gibi)
-                        # Şimdilik boş bırakıyoruz, özel işlem kısmında yapılacak
+                        # Normal işlem - debug mesajları kaldırıldı
+                        pass
+                    
+                    # Delphi ve Schaflerr için işlem yapılması gereken koşul
+                    if ('DELPHI' in brand or 'SCHAEFFLER LUK' in brand or 'SCHAFLERR' in brand) and brand_count > 0:
+                        # Tedarikçi bakiye işlemi - debug mesajları kaldırıldı
+                        pass
+                    
+                    # Bosch için işlem yapılması gereken koşul
+                    if 'BOSCH' in brand and brand_count > 0:
+                        # Depo Bakiye ve Tedarikçi Bakiye işlemi - debug mesajları kaldırıldı
+                        pass
                     
                     # Schaeffler Luk için tedarikçi bakiye işlemi
-                    if 'SCHAEFFLER LUK' in brand:
+                    if 'SCHAEFFLER LUK' in brand or 'SCHAFLERR' in brand:
                         try:
                             # Tedarikçi bakiye kolonlarını oluştur
                             if 'İmes Tedarikçi Bakiye' not in result_df.columns:
@@ -421,10 +613,14 @@ def match_brands_parallel(main_df, uploaded_files):
                                     else 'Diğer'
                                 )
                                 
-                                # Catalogue Number işleme
+                                # Catalogue Number işleme - Geliştirilmiş
                                 if 'Catalogue number' in schaeffler_df.columns:
-                                    # Sondaki 0'ı sil ve boşlukları temizle
-                                    schaeffler_df['Catalogue_clean'] = schaeffler_df['Catalogue number'].astype(str).str.rstrip('0').str.strip()
+                                    # Geliştirilmiş Schaeffler kod işleme
+                                    schaeffler_df['Catalogue_clean'] = schaeffler_df['Catalogue number'].apply(process_schaeffler_codes)
+                                    
+                                    # Catalogue number kodlarını temizle - debug mesajları kaldırıldı
+                                    total_codes = len(schaeffler_df['Catalogue_clean'])
+                                    unique_codes = schaeffler_df['Catalogue_clean'].nunique()
                                 
                                 # Ordered Quantity kontrolü
                                 if 'Ordered quantity' in schaeffler_df.columns:
@@ -436,15 +632,36 @@ def match_brands_parallel(main_df, uploaded_files):
                                             # Catalogue number bazında topla
                                             grouped = tedarikci_data.groupby('Catalogue_clean')['Ordered quantity'].sum().reset_index()
                                             
-                                            # Ana DataFrame ile eşleştir
+                                            # Ana DataFrame ile eşleştir - Geliştirilmiş
                                             for _, row in grouped.iterrows():
                                                 catalogue_num = row['Catalogue_clean']
                                                 quantity = row['Ordered quantity']
                                                 
-                                                # URUNKODU ile eşleştir (boşlukları temizle)
-                                                urunkodu_clean = result_df['URUNKODU'].astype(str).str.strip()
-                                                match_mask = urunkodu_clean.str.contains(catalogue_num, case=False, na=False)
+                                                # Geliştirilmiş eşleştirme: Hem URUNKODU hem de Düzenlenmiş Ürün Kodu ile
+                                                urunkodu_codes = result_df['URUNKODU'].astype(str).tolist()
+                                                duzenlenmis_codes = result_df['Düzenlenmiş Ürün Kodu'].astype(str).tolist()
                                                 
+                                                # Tam eşleşme kontrolü
+                                                urunkodu_clean = result_df['URUNKODU'].astype(str).apply(clean_product_code)
+                                                duzenlenmis_clean = result_df['Düzenlenmiş Ürün Kodu'].astype(str).apply(clean_product_code)
+                                                catalogue_clean = clean_product_code(catalogue_num)
+                                                
+                                                # Tam eşleşme
+                                                match_mask_urun = urunkodu_clean == catalogue_clean
+                                                match_mask_duzen = duzenlenmis_clean == catalogue_clean
+                                                match_mask = match_mask_urun | match_mask_duzen
+                                                
+                                                # Eğer tam eşleşme yoksa, fuzzy matching dene
+                                                if not match_mask.any():
+                                                    best_match, best_ratio = find_best_match(catalogue_num, urunkodu_codes + duzenlenmis_codes, threshold=0.85)
+                                                    if best_match and best_ratio >= 0.85:
+                                                        # Fuzzy match bulundu, en yakın eşleşmeyi bul
+                                                        fuzzy_match_mask = (urunkodu_clean == clean_product_code(best_match)) | (duzenlenmis_clean == clean_product_code(best_match))
+                                                        if fuzzy_match_mask.any():
+                                                            match_mask = fuzzy_match_mask
+                                
+                                                # Eşleştirme işlemi - debug mesajları kaldırıldı
+                                
                                                 if match_mask.sum() > 0:
                                                     # Tedarikçi kolonunu güncelle (toplama ile)
                                                     if tedarikci == 'İmes':
@@ -457,8 +674,9 @@ def match_brands_parallel(main_df, uploaded_files):
                                                         result_df.loc[match_mask, 'Maslak Tedarikçi Bakiye'] += quantity
                                                     elif tedarikci == 'İkitelli':
                                                         result_df.loc[match_mask, 'İkitelli Tedarikçi Bakiye'] += quantity
+                                                # Eşleşme bulunamadı - sessiz devam
                                 
-                                st.success(f"✅ Schaeffler Luk verileri işlendi: {len(schaeffler_df)} satır")
+
                             else:
                                 st.warning("⚠️ Schaeffler dosyasında 'PO Number(L)' kolonu bulunamadı")
                                 
@@ -492,21 +710,7 @@ def match_brands_parallel(main_df, uploaded_files):
                                     else x.replace(' ', '')  # : yoksa boşlukları sil
                                 )
                                 
-                                # Debug: İlk 5 örnek göster
-                                st.info(f"🔍 ZF İthal Material işleme örnekleri:")
-                                for i, (original, cleaned) in enumerate(zip(zf_ithal_df['Material'].head(), zf_ithal_df['Material_clean'].head())):
-                                    st.write(f"  {original} → {cleaned}")
-                                
-                                # Debug: Eşleştirme örnekleri
-                                st.info(f"🔍 ZF İthal eşleştirme örnekleri:")
-                                for i, material_num in enumerate(zf_ithal_df['Material_clean'].head()):
-                                    urunkodu_clean = result_df['URUNKODU'].astype(str).str.strip()
-                                    duzenlenmis_clean = result_df['Düzenlenmiş Ürün Kodu'].astype(str).str.replace(' ', '', regex=False)
-                                    
-                                    match_urun = urunkodu_clean.str.contains(material_num, case=False, na=False).sum()
-                                    match_duzen = duzenlenmis_clean.str.contains(material_num, case=False, na=False).sum()
-                                    
-                                    st.write(f"  {material_num} → URUNKODU: {match_urun}, Düzenlenmiş: {match_duzen}")
+                                # Material kodlarını temizle - debug mesajları kaldırıldı
                                 
                                 # Purchase order no. kolonunu kontrol et
                                 if 'Purchase order no.' in zf_ithal_df.columns:
@@ -520,19 +724,8 @@ def match_brands_parallel(main_df, uploaded_files):
                                         else 'Diğer'
                                     )
                                     
-                                    # Debug: Tedarikçi dağılımını göster
+                                    # Tedarikçi dağılımı hesapla - debug mesajları kaldırıldı
                                     tedarikci_counts = zf_ithal_df['Tedarikçi'].value_counts()
-                                    st.info(f"🔍 ZF İthal Tedarikçi dağılımı:")
-                                    for tedarikci, count in tedarikci_counts.items():
-                                        st.write(f"  {tedarikci}: {count} satır")
-                                    
-                                    # Debug: Örnek Purchase order no. kodları göster
-                                    st.info("🔍 ZF İthal Purchase order no. örnekleri:")
-                                    for tedarikci in ['İmes', 'Ankara', 'Bolu', 'Maslak', 'İkitelli']:
-                                        tedarikci_data = zf_ithal_df[zf_ithal_df['Tedarikçi'] == tedarikci]
-                                        if len(tedarikci_data) > 0:
-                                            sample_codes = tedarikci_data['Purchase order no.'].head(3).tolist()
-                                            st.write(f"  {tedarikci}: {sample_codes}")
                                 
                                 # Qty.in Del. ve Open quantity kolonlarını kontrol et
                                 if 'Qty.in Del.' in zf_ithal_df.columns and 'Open quantity' in zf_ithal_df.columns:
@@ -559,21 +752,15 @@ def match_brands_parallel(main_df, uploaded_files):
                                                 trw_mask = result_df['CAT4'].str.contains('TRW', case=False, na=False)
                                                 sachs_mask = result_df['CAT4'].str.contains('SACHS', case=False, na=False)
                                                 
-                                                # Hem URUNKODU hem de Düzenlenmiş Ürün Kodu ile eşleştir
-                                                urunkodu_clean = result_df['URUNKODU'].astype(str).str.strip()
-                                                duzenlenmis_clean = result_df['Düzenlenmiş Ürün Kodu'].astype(str).str.replace(' ', '', regex=False)
+                                                # Hem URUNKODU hem de Düzenlenmiş Ürün Kodu ile tam eşleştir (case-insensitive)
+                                                urunkodu_clean = result_df['URUNKODU'].astype(str).str.strip().str.replace(' ', '', regex=False).str.upper()
+                                                duzenlenmis_clean = result_df['Düzenlenmiş Ürün Kodu'].astype(str).str.replace(' ', '', regex=False).str.upper()
+                                                material_clean = material_num.replace(' ', '').upper()
                                                 
-                                                # Boşlukları temizlenmiş versiyonlar da oluştur
-                                                urunkodu_no_space = urunkodu_clean.str.replace(' ', '', regex=False)
-                                                duzenlenmis_no_space = duzenlenmis_clean.str.replace(' ', '', regex=False)
-                                                material_no_space = material_num.replace(' ', '')
-                                                
-                                                # Dört farklı eşleştirme yöntemi dene
-                                                match_mask_urun = urunkodu_clean.str.contains(material_num, case=False, na=False)
-                                                match_mask_duzen = duzenlenmis_clean.str.contains(material_num, case=False, na=False)
-                                                match_mask_urun_no_space = urunkodu_no_space.str.contains(material_no_space, case=False, na=False)
-                                                match_mask_duzen_no_space = duzenlenmis_no_space.str.contains(material_no_space, case=False, na=False)
-                                                match_mask = match_mask_urun | match_mask_duzen | match_mask_urun_no_space | match_mask_duzen_no_space
+                                                # Tam eşleştirme yap (case-insensitive)
+                                                match_mask_urun = urunkodu_clean == material_clean
+                                                match_mask_duzen = duzenlenmis_clean == material_clean
+                                                match_mask = match_mask_urun | match_mask_duzen
                                                 
                                                 # LEMFÖRDER, TRW, SACHS markaları ile birleştir
                                                 final_mask = match_mask & (lemforder_mask | trw_mask | sachs_mask)
@@ -582,30 +769,27 @@ def match_brands_parallel(main_df, uploaded_files):
                                                     # Tedarikçi kolonunu güncelle (toplama ile)
                                                     if tedarikci == 'İmes':
                                                         result_df.loc[final_mask, 'İmes Tedarikçi Bakiye'] += total_qty
+
                                                     elif tedarikci == 'Ankara':
                                                         result_df.loc[final_mask, 'Ankara Tedarikçi Bakiye'] += total_qty
+
                                                     elif tedarikci == 'Bolu':
                                                         result_df.loc[final_mask, 'Bolu Tedarikçi Bakiye'] += total_qty
+
                                                     elif tedarikci == 'Maslak':
                                                         result_df.loc[final_mask, 'Maslak Tedarikçi Bakiye'] += total_qty
+
                                                     elif tedarikci == 'İkitelli':
                                                         result_df.loc[final_mask, 'İkitelli Tedarikçi Bakiye'] += total_qty
+
                                                     
-                                                    # Debug bilgisi
-                                                    st.info(f"🔍 ZF İthal: {material_num} → {final_mask.sum()} eşleşme bulundu")
+
                                                 else:
                                                     # Eşleşme bulunamadığında detaylı debug bilgisi
-                                                    st.warning(f"⚠️ ZF İthal: {material_num} için eşleşme bulunamadı")
-                                                    st.write(f"  Material (temiz): {material_num}")
-                                                    st.write(f"  Material (boşluksuz): {material_no_space}")
-                                                    
-                                                    # Örnek URUNKODU ve Düzenlenmiş Ürün Kodu göster
-                                                    sample_urun = result_df['URUNKODU'].head(5).tolist()
-                                                    sample_duzen = result_df['Düzenlenmiş Ürün Kodu'].head(5).tolist()
-                                                    st.write(f"  Örnek URUNKODU: {sample_urun}")
-                                                    st.write(f"  Örnek Düzenlenmiş: {sample_duzen}")
+                                                    # Eşleşme bulunamadı - sessiz devam
+                                                    pass
                                 
-                                st.success(f"✅ ZF İthal verileri işlendi: {len(zf_ithal_df)} satır")
+
                             else:
                                 st.warning("⚠️ ZF İthal dosyasında 'Material' kolonu bulunamadı")
                                 
@@ -647,11 +831,8 @@ def match_brands_parallel(main_df, uploaded_files):
                                         else 'Diğer'
                                     )
                                     
-                                    # Debug: Tedarikçi dağılımını göster
+                                    # Tedarikçi dağılımı hesapla - debug mesajları kaldırıldı
                                     tedarikci_counts = zf_yerli_df['Tedarikçi'].value_counts()
-                                    st.info(f"🔍 ZF Yerli Tedarikçi dağılımı:")
-                                    for tedarikci, count in tedarikci_counts.items():
-                                        st.write(f"  {tedarikci}: {count} satır")
                                 
                                 # Outstanding Quantity kolonunu kontrol et
                                 if 'Outstanding Quantity' in zf_yerli_df.columns:
@@ -673,9 +854,10 @@ def match_brands_parallel(main_df, uploaded_files):
                                                 trw_mask = result_df['CAT4'].str.contains('TRW', case=False, na=False)
                                                 sachs_mask = result_df['CAT4'].str.contains('SACHS', case=False, na=False)
                                                 
-                                                # Düzenlenmiş Ürün Kodu ile eşleştir (boşlukları temizle)
-                                                duzenlenmis_clean = result_df['Düzenlenmiş Ürün Kodu'].astype(str).str.strip()
-                                                match_mask = duzenlenmis_clean.str.contains(basic_num, case=False, na=False)
+                                                # Düzenlenmiş Ürün Kodu ile tam eşleştir (case-insensitive, boşlukları temizle)
+                                                duzenlenmis_clean = result_df['Düzenlenmiş Ürün Kodu'].astype(str).str.strip().str.replace(' ', '', regex=False).str.upper()
+                                                basic_clean = basic_num.replace(' ', '').upper()
+                                                match_mask = duzenlenmis_clean == basic_clean
                                                 
                                                 # LEMFÖRDER, TRW, SACHS markaları ile birleştir
                                                 final_mask = match_mask & (lemforder_mask | trw_mask | sachs_mask)
@@ -684,16 +866,21 @@ def match_brands_parallel(main_df, uploaded_files):
                                                     # Tedarikçi kolonunu güncelle (toplama ile)
                                                     if tedarikci == 'İmes':
                                                         result_df.loc[final_mask, 'İmes Tedarikçi Bakiye'] += quantity
+
                                                     elif tedarikci == 'Ankara':
                                                         result_df.loc[final_mask, 'Ankara Tedarikçi Bakiye'] += quantity
+
                                                     elif tedarikci == 'Bolu':
                                                         result_df.loc[final_mask, 'Bolu Tedarikçi Bakiye'] += quantity
+
                                                     elif tedarikci == 'Maslak':
                                                         result_df.loc[final_mask, 'Maslak Tedarikçi Bakiye'] += quantity
+
                                                     elif tedarikci == 'İkitelli':
                                                         result_df.loc[final_mask, 'İkitelli Tedarikçi Bakiye'] += quantity
+
                                 
-                                st.success(f"✅ ZF Yerli verileri işlendi: {len(zf_yerli_df)} satır")
+
                             else:
                                 st.warning("⚠️ ZF Yerli dosyasında 'Basic No.' kolonu bulunamadı")
                                 
@@ -730,10 +917,14 @@ def match_brands_parallel(main_df, uploaded_files):
                                     else 'Diğer'
                                 )
                                 
-                                # Valeo Ref. kolonunu kontrol et
+                                # Valeo Ref. kolonunu kontrol et - Geliştirilmiş
                                 if 'Valeo Ref.' in valeo_df.columns:
-                                    # Valeo Ref. kodunu temizle
-                                    valeo_df['Valeo_clean'] = valeo_df['Valeo Ref.'].astype(str).str.strip()
+                                    # Geliştirilmiş Valeo kod işleme
+                                    valeo_df['Valeo_clean'] = valeo_df['Valeo Ref.'].apply(process_valeo_codes)
+                                    
+                                    # Valeo Ref. kodlarını temizle - debug mesajları kaldırıldı
+                                    total_codes = len(valeo_df['Valeo_clean'])
+                                    unique_codes = valeo_df['Valeo_clean'].nunique()
                                 
                                 # Sipariş Adeti kolonunu kontrol et
                                 if 'Sipariş Adeti' in valeo_df.columns:
@@ -745,29 +936,60 @@ def match_brands_parallel(main_df, uploaded_files):
                                             # Valeo_clean bazında topla
                                             grouped = tedarikci_data.groupby('Valeo_clean')['Sipariş Adeti'].sum().reset_index()
                                             
-                                            # Ana DataFrame ile eşleştir
+                                            # Ana DataFrame ile eşleştir - Geliştirilmiş
                                             for _, row in grouped.iterrows():
                                                 valeo_ref = row['Valeo_clean']
                                                 quantity = row['Sipariş Adeti']
                                                 
-                                                # URUNKODU ile eşleştir (boşlukları temizle)
-                                                urunkodu_clean = result_df['URUNKODU'].astype(str).str.strip()
-                                                match_mask = urunkodu_clean.str.contains(valeo_ref, case=False, na=False)
+                                                # Geliştirilmiş eşleştirme: Hem URUNKODU hem de Düzenlenmiş Ürün Kodu ile
+                                                urunkodu_codes = result_df['URUNKODU'].astype(str).tolist()
+                                                duzenlenmis_codes = result_df['Düzenlenmiş Ürün Kodu'].astype(str).tolist()
                                                 
+                                                # Tam eşleşme kontrolü
+                                                urunkodu_clean = result_df['URUNKODU'].astype(str).apply(clean_product_code)
+                                                duzenlenmis_clean = result_df['Düzenlenmiş Ürün Kodu'].astype(str).apply(clean_product_code)
+                                                valeo_clean = clean_product_code(valeo_ref)
+                                                
+                                                # Tam eşleşme
+                                                match_mask_urun = urunkodu_clean == valeo_clean
+                                                match_mask_duzen = duzenlenmis_clean == valeo_clean
+                                                match_mask = match_mask_urun | match_mask_duzen
+                                                
+                                                # Eğer tam eşleşme yoksa, fuzzy matching dene
+                                                if not match_mask.any():
+                                                    best_match, best_ratio = find_best_match(valeo_ref, urunkodu_codes + duzenlenmis_codes, threshold=0.85)
+                                                    if best_match and best_ratio >= 0.85:
+                                                        # Fuzzy match bulundu, en yakın eşleşmeyi bul
+                                                        fuzzy_match_mask = (urunkodu_clean == clean_product_code(best_match)) | (duzenlenmis_clean == clean_product_code(best_match))
+                                                        if fuzzy_match_mask.any():
+                                                            match_mask = fuzzy_match_mask
+
+                                
+                                                # Eşleştirme işlemi - debug mesajları kaldırıldı
+                                
                                                 if match_mask.sum() > 0:
                                                     # Tedarikçi kolonunu güncelle (toplama ile)
                                                     if tedarikci == 'İmes':
                                                         result_df.loc[match_mask, 'İmes Tedarikçi Bakiye'] += quantity
+
                                                     elif tedarikci == 'Ankara':
                                                         result_df.loc[match_mask, 'Ankara Tedarikçi Bakiye'] += quantity
+
                                                     elif tedarikci == 'Bolu':
                                                         result_df.loc[match_mask, 'Bolu Tedarikçi Bakiye'] += quantity
+
                                                     elif tedarikci == 'Maslak':
                                                         result_df.loc[match_mask, 'Maslak Tedarikçi Bakiye'] += quantity
+
                                                     elif tedarikci == 'İkitelli':
                                                         result_df.loc[match_mask, 'İkitelli Tedarikçi Bakiye'] += quantity
+
+                                                else:
+                                                    # Eşleşme bulunamadığında detaylı debug bilgisi
+                                                    # Eşleşme bulunamadı - sessiz devam
+                                                    pass
                                 
-                                st.success(f"✅ Valeo verileri işlendi: {len(valeo_df)} satır")
+
                             else:
                                 st.warning("⚠️ Valeo dosyasında 'Müşteri P/O No.' kolonu bulunamadı")
                                 
@@ -808,6 +1030,9 @@ def match_brands_parallel(main_df, uploaded_files):
                                 if 'Material' in delphi_df.columns:
                                     # Material kodunu temizle
                                     delphi_df['Material_clean'] = delphi_df['Material'].astype(str).str.strip()
+                                    
+                                    # Debug: Material kolonu işleme örnekleri göster
+                                    # Delphi Material kodlarını temizle - debug mesajları kaldırıldı
                                 
                                 # Cum.qty kolonunu kontrol et
                                 if 'Cum.qty' in delphi_df.columns:
@@ -824,32 +1049,166 @@ def match_brands_parallel(main_df, uploaded_files):
                                                 material_num = row['Material_clean']
                                                 quantity = row['Cum.qty']
                                                 
-                                                # URUNKODU ile eşleştir (boşlukları temizle)
-                                                urunkodu_clean = result_df['URUNKODU'].astype(str).str.strip()
-                                                match_mask = urunkodu_clean.str.contains(material_num, case=False, na=False)
+                                                # Hem URUNKODU hem de Düzenlenmiş Ürün Kodu ile eşleştir
+                                                urunkodu_clean = result_df['URUNKODU'].astype(str).str.strip().str.replace(' ', '', regex=False).str.upper()
+                                                duzenlenmis_clean = result_df['Düzenlenmiş Ürün Kodu'].astype(str).str.strip().str.replace(' ', '', regex=False).str.upper()
+                                                material_clean = material_num.replace(' ', '').upper()
+                                                
+                                                # Her iki kolonla da eşleştir
+                                                match_mask_urun = urunkodu_clean == material_clean
+                                                match_mask_duzen = duzenlenmis_clean == material_clean
+                                                match_mask = match_mask_urun | match_mask_duzen
+                                                
+                                                # Debug: İlk 5 eşleştirme örneği göster
+                                                if _ < 5:
+                                                    match_count = match_mask.sum()
+                                                    match_count_urun = match_mask_urun.sum()
+                                                    match_count_duzen = match_mask_duzen.sum()
+                                                    st.info(f"🔍 Delphi eşleştirme: {material_num} → {match_count} eşleşme (URUNKODU: {match_count_urun}, Düzenlenmiş: {match_count_duzen})")
                                                 
                                                 if match_mask.sum() > 0:
                                                     # Tedarikçi kolonunu güncelle (toplama ile)
                                                     if tedarikci == 'İmes':
                                                         result_df.loc[match_mask, 'İmes Tedarikçi Bakiye'] += quantity
+
                                                     elif tedarikci == 'Ankara':
                                                         result_df.loc[match_mask, 'Ankara Tedarikçi Bakiye'] += quantity
+
                                                     elif tedarikci == 'Bolu':
                                                         result_df.loc[match_mask, 'Bolu Tedarikçi Bakiye'] += quantity
+
                                                     elif tedarikci == 'Maslak':
                                                         result_df.loc[match_mask, 'Maslak Tedarikçi Bakiye'] += quantity
+
                                                     elif tedarikci == 'İkitelli':
                                                         result_df.loc[match_mask, 'İkitelli Tedarikçi Bakiye'] += quantity
+
+                                                else:
+                                                    # Eşleşme bulunamadığında debug bilgisi
+                                                    # Eşleşme bulunamadı - sessiz devam
+                                                    pass
                                 
-                                st.success(f"✅ Delphi verileri işlendi: {len(delphi_df)} satır")
+
                             else:
                                 st.warning("⚠️ Delphi dosyasında 'Şube' kolonu bulunamadı")
                                 
                         except Exception as e:
                             st.error(f"❌ Delphi veri işleme hatası: {str(e)}")
                 
+                    # Bosch için özel işleme mantığı
+                    elif 'BOSCH' in brand:
+                        try:
+                            # Depo Bakiye ve Tedarikçi Bakiye kolonlarını oluştur
+                            depo_bakiye_cols = ['İmes Depo Bakiye', 'Ankara Depo Bakiye', 'Bolu Depo Bakiye', 'Maslak Depo Bakiye', 'İkitelli Depo Bakiye']
+                            tedarikci_bakiye_cols = ['İmes Tedarikçi Bakiye', 'Ankara Tedarikçi Bakiye', 'Bolu Tedarikçi Bakiye', 'Maslak Tedarikçi Bakiye', 'İkitelli Tedarikçi Bakiye']
+                            
+                            for col in depo_bakiye_cols:
+                                if col not in result_df.columns:
+                                    result_df[col] = 0
+                            
+                            for col in tedarikci_bakiye_cols:
+                                if col not in result_df.columns:
+                                    result_df[col] = 0
+                            
+                            # Bosch verilerini işle
+                            bosch_df = brand_df.copy()
+                            
+                            # Gerekli kolonları kontrol et
+                            required_cols = ['Depo Kodu', 'Ürün Grubu', 'Bosch No', 'Fatura ve Sevk Edilmemiş Toplam']
+                            missing_cols = [col for col in required_cols if col not in bosch_df.columns]
+                            
+                            if missing_cols:
+                                st.warning(f"⚠️ Bosch dosyasında eksik kolonlar: {missing_cols}")
+                                st.info(f"🔍 Mevcut kolonlar: {list(bosch_df.columns)}")
+                            else:
+                                # Depo Kodu kolonunu depo isimlerine çevir
+                                depo_mapping = {
+                                    'AAS': 'Ankara',
+                                    'BAS': 'Bolu', 
+                                    'DAS': 'İmes',
+                                    'EAS': 'İkitelli',
+                                    'MAS': 'Maslak'
+                                }
+                                
+                                bosch_df['Depo_Adi'] = bosch_df['Depo Kodu'].astype(str).map(depo_mapping)
+                                
+                                # Ürün Grubu kolonunu kontrol et
+                                bosch_df['Bakiye_Tipi'] = bosch_df['Ürün Grubu'].astype(str).apply(
+                                    lambda x: 'Tedarikçi' if 'TEDARİKÇİ' in x.upper()
+                                    else 'Depo' if 'DEPO' in x.upper()
+                                    else 'Bilinmiyor'
+                                )
+                                
+                                # Bosch No kolonunu temizle
+                                bosch_df['Bosch_No_Clean'] = bosch_df['Bosch No'].astype(str).str.strip()
+                                
+                                # Fatura ve Sevk Edilmemiş Toplam kolonunu sayısal yap
+                                bosch_df['Toplam_Adet'] = pd.to_numeric(bosch_df['Fatura ve Sevk Edilmemiş Toplam'], errors='coerce').fillna(0)
+                                
+                                # Aynı Ürün Grubu ve Depo Koduna sahip aynı Bosch No lu ürünlerde adetleri topla
+                                grouped_bosch = bosch_df.groupby(['Bosch_No_Clean', 'Depo_Adi', 'Bakiye_Tipi'])['Toplam_Adet'].sum().reset_index()
+                                
+                                # Ana DataFrame ile eşleştir
+                                for _, row in grouped_bosch.iterrows():
+                                    bosch_no = row['Bosch_No_Clean']
+                                    depo_adi = row['Depo_Adi']
+                                    bakiye_tipi = row['Bakiye_Tipi']
+                                    toplam_adet = row['Toplam_Adet']
+                                    
+                                    # CAT4 kolonunda BOSCH markası ile eşleşen ürünleri bul
+                                    bosch_mask = result_df['CAT4'].str.contains('BOSCH', case=False, na=False)
+                                    
+                                    # Bosch No ile eşleştir (hem URUNKODU hem de Düzenlenmiş Ürün Kodu ile)
+                                    urunkodu_clean = result_df['URUNKODU'].astype(str).str.strip().str.replace(' ', '', regex=False).str.upper()
+                                    duzenlenmis_clean = result_df['Düzenlenmiş Ürün Kodu'].astype(str).str.strip().str.replace(' ', '', regex=False).str.upper()
+                                    bosch_no_clean = bosch_no.replace(' ', '').upper()
+                                    
+                                    # Tam eşleştirme yap
+                                    match_mask_urun = urunkodu_clean == bosch_no_clean
+                                    match_mask_duzen = duzenlenmis_clean == bosch_no_clean
+                                    match_mask = (match_mask_urun | match_mask_duzen) & bosch_mask
+                                    
+                                    if match_mask.sum() > 0:
+                                        # Depo Bakiye veya Tedarikçi Bakiye kolonunu güncelle
+                                        if bakiye_tipi == 'Depo':
+                                            if depo_adi == 'İmes':
+                                                result_df.loc[match_mask, 'İmes Depo Bakiye'] += toplam_adet
+                                            elif depo_adi == 'Ankara':
+                                                result_df.loc[match_mask, 'Ankara Depo Bakiye'] += toplam_adet
+                                            elif depo_adi == 'Bolu':
+                                                result_df.loc[match_mask, 'Bolu Depo Bakiye'] += toplam_adet
+                                            elif depo_adi == 'Maslak':
+                                                result_df.loc[match_mask, 'Maslak Depo Bakiye'] += toplam_adet
+                                            elif depo_adi == 'İkitelli':
+                                                result_df.loc[match_mask, 'İkitelli Depo Bakiye'] += toplam_adet
+                                        
+                                        elif bakiye_tipi == 'Tedarikçi':
+                                            if depo_adi == 'İmes':
+                                                result_df.loc[match_mask, 'İmes Tedarikçi Bakiye'] += toplam_adet
+                                            elif depo_adi == 'Ankara':
+                                                result_df.loc[match_mask, 'Ankara Tedarikçi Bakiye'] += toplam_adet
+                                            elif depo_adi == 'Bolu':
+                                                result_df.loc[match_mask, 'Bolu Tedarikçi Bakiye'] += toplam_adet
+                                            elif depo_adi == 'Maslak':
+                                                result_df.loc[match_mask, 'Maslak Tedarikçi Bakiye'] += toplam_adet
+                                            elif depo_adi == 'İkitelli':
+                                                result_df.loc[match_mask, 'İkitelli Tedarikçi Bakiye'] += toplam_adet
+                                        
+                                        st.success(f"✅ Bosch eşleştirme: {bosch_no} → {depo_adi} {bakiye_tipi} → {toplam_adet} adet")
+                                    else:
+                                        st.warning(f"⚠️ Bosch eşleştirme bulunamadı: {bosch_no}")
+                                
+                                # Bosch işleme özeti
+                                total_bosch_products = len(grouped_bosch)
+                                st.info(f"🔍 Bosch işleme tamamlandı: {total_bosch_products} ürün grubu işlendi")
+                                st.info(f"📊 Kullanılan kolonlar: Depo Kodu, Ürün Grubu, Bosch No, Fatura ve Sevk Edilmemiş Toplam")
+                                
+                        except Exception as e:
+                            st.error(f"❌ Bosch veri işleme hatası: {str(e)}")
+                            st.error(f"💡 Hata detayı: {e.__class__.__name__}")
+                
                     # Mann ve Filtron için tedarikçi bakiye işlemi
-                    if 'MANN' in brand or 'FİLTRON' in brand:
+                    if 'MANN' in brand or 'FILTRON' in brand:
                         try:
                             # Tedarikçi bakiye kolonlarını oluştur
                             if 'İmes Tedarikçi Bakiye' not in result_df.columns:
@@ -874,13 +1233,25 @@ def match_brands_parallel(main_df, uploaded_files):
                                     break
                             
                             if material_col:
-                                st.info(f"🔍 {brand} için {material_col} kolonu bulundu!")
+                                # Material kolonu bulundu - debug mesajları kaldırıldı
+                                
+                                # Kolonlar listelendi - debug mesajları kaldırıldı
+                                
+                                # Önemli kolonlar kontrol edildi - debug mesajları kaldırıldı
+                                important_cols = ['Müşteri SatınAlma No', 'Açık Sipariş Adedi', 'Material Kodu', 'Material Adı']
                                 
                                 # Material kodunu temizle (bulunan kolon adını kullan)
                                 brand_df_processed['Material_clean'] = brand_df_processed[material_col].astype(str).str.strip()
                                 
+                                # Material örnekleri - debug mesajları kaldırıldı
+                                sample_materials = brand_df_processed[material_col].head(10).tolist()
+                                sample_cleaned = brand_df_processed['Material_clean'].head(10).tolist()
+                                
                                 # Müşteri SatınAlma No kolonunu kontrol et
                                 if 'Müşteri SatınAlma No' in brand_df_processed.columns:
+                                    # Müşteri SatınAlma No örnekleri - debug mesajları kaldırıldı
+                                    sample_codes = brand_df_processed['Müşteri SatınAlma No'].head(10).tolist()
+                                    
                                     # Tedarikçi kodlarını belirle
                                     brand_df_processed['Tedarikçi'] = brand_df_processed['Müşteri SatınAlma No'].astype(str).apply(
                                         lambda x: 'Ankara' if 'AAS' in x
@@ -890,6 +1261,9 @@ def match_brands_parallel(main_df, uploaded_files):
                                         else 'İkitelli' if 'EAS' in x
                                         else 'Diğer'
                                     )
+                                    
+                                    # Tedarikçi dağılımı hesapla - debug mesajları kaldırıldı
+                                    tedarikci_dist = brand_df_processed['Tedarikçi'].value_counts()
                                 
                                 # Açık Sipariş Adedi kolonunu kontrol et
                                 if 'Açık Sipariş Adedi' in brand_df_processed.columns:
@@ -906,178 +1280,53 @@ def match_brands_parallel(main_df, uploaded_files):
                                                 material_num = row['Material_clean']
                                                 quantity = row['Açık Sipariş Adedi']
                                                 
-                                                # Hem URUNKODU hem de Düzenlenmiş Ürün Kodu ile eşleştir
-                                                urunkodu_clean = result_df['URUNKODU'].astype(str).str.strip()
-                                                duzenlenmis_clean = result_df['Düzenlenmiş Ürün Kodu'].astype(str).str.replace(' ', '', regex=False)
-                                                material_clean_no_space = material_num.replace(' ', '')
+                                                # Hem URUNKODU hem de Düzenlenmiş Ürün Kodu ile tam eşleştir (case-insensitive)
+                                                urunkodu_clean = result_df['URUNKODU'].astype(str).str.strip().str.replace(' ', '', regex=False).str.upper()
+                                                duzenlenmis_clean = result_df['Düzenlenmiş Ürün Kodu'].astype(str).str.strip().str.replace(' ', '', regex=False).str.upper()
+                                                material_clean_no_space = material_num.replace(' ', '').upper()
                                                 
-                                                # İki farklı eşleştirme yöntemi dene
-                                                match_mask_urun = urunkodu_clean.str.contains(material_clean_no_space, case=False, na=False)
-                                                match_mask_duzen = duzenlenmis_clean.str.contains(material_clean_no_space, case=False, na=False)
+                                                # Tam eşleştirme yap (case-insensitive)
+                                                match_mask_urun = urunkodu_clean == material_clean_no_space
+                                                match_mask_duzen = duzenlenmis_clean == material_clean_no_space
                                                 match_mask = match_mask_urun | match_mask_duzen
+                                                
+                                                # Debug: Eşleştirme detayları
+                                                st.info(f"🔍 {brand} tam eşleştirme (case-insensitive): {material_num} → {material_clean_no_space}")
+                                                st.info(f"  URUNKODU tam eşleşme: {match_mask_urun.sum()} adet")
+                                                st.info(f"  Düzenlenmiş Ürün Kodu tam eşleşme: {match_mask_duzen.sum()} adet")
+                                                st.info(f"  Toplam tam eşleşme: {match_mask.sum()} adet")
                                                 
                                                 if match_mask.sum() > 0:
                                                     # Tedarikçi kolonunu güncelle (toplama ile)
                                                     if tedarikci == 'İmes':
                                                         result_df.loc[match_mask, 'İmes Tedarikçi Bakiye'] += quantity
-                                                        st.success(f"✅ {brand} {tedarikci}: {material_num} → {quantity} adet eklendi")
+
                                                     elif tedarikci == 'Ankara':
                                                         result_df.loc[match_mask, 'Ankara Tedarikçi Bakiye'] += quantity
-                                                        st.success(f"✅ {brand} {tedarikci}: {material_num} → {quantity} adet eklendi")
+
                                                     elif tedarikci == 'Bolu':
                                                         result_df.loc[match_mask, 'Bolu Tedarikçi Bakiye'] += quantity
-                                                        st.success(f"✅ {brand} {tedarikci}: {material_num} → {quantity} adet eklendi")
+
                                                     elif tedarikci == 'Maslak':
                                                         result_df.loc[match_mask, 'Maslak Tedarikçi Bakiye'] += quantity
-                                                        st.success(f"✅ {brand} {tedarikci}: {material_num} → {quantity} adet eklendi")
+
                                                     elif tedarikci == 'İkitelli':
                                                         result_df.loc[match_mask, 'İkitelli Tedarikçi Bakiye'] += quantity
-                                                        st.success(f"✅ {brand} {tedarikci}: {material_num} → {quantity} adet eklendi")
+
                                                 else:
-                                                    # Eşleşme bulunamadığında debug bilgisi
-                                                    st.warning(f"⚠️ {brand}: {material_num} için eşleşme bulunamadı")
+                                                    # Eşleşme bulunamadı - sessiz devam
+                                                    pass
+
                                 
-                                st.success(f"✅ {brand} verileri işlendi: {len(brand_df_processed)} satır")
-                                
-                                # Debug: Sonuç kontrolü
-                                st.info(f"🔍 {brand} sonuç kontrolü:")
-                                for tedarikci in ['İmes', 'Ankara', 'Bolu', 'Maslak', 'İkitelli']:
-                                    col_name = f"{tedarikci} Tedarikçi Bakiye"
-                                    if col_name in result_df.columns:
-                                        total = result_df[col_name].sum()
-                                        st.write(f"  {tedarikci}: {total} adet")
+                                # Sonuç kontrolü - debug mesajları kaldırıldı
                             else:
-                                st.warning(f"⚠️ {brand} dosyasında gerekli kolonlar bulunamadı. Mevcut kolonlar: {list(brand_df_processed.columns)}")
+                                pass
                                 
                         except Exception as e:
                             st.error(f"❌ {brand} veri işleme hatası: {str(e)}")
                 
-                else:
+                if brand_count == 0:
                     st.warning(f"⚠️ {brand} markası CAT4 kolonunda bulunamadı")
-                            # Tedarikçi bakiye kolonlarını oluştur
-                            if 'İmes Tedarikçi Bakiye' not in result_df.columns:
-                                result_df['İmes Tedarikçi Bakiye'] = 0
-                            if 'Ankara Tedarikçi Bakiye' not in result_df.columns:
-                                result_df['Ankara Tedarikçi Bakiye'] = 0
-                            if 'Bolu Tedarikçi Bakiye' not in result_df.columns:
-                                result_df['Bolu Tedarikçi Bakiye'] = 0
-                            if 'Maslak Tedarikçi Bakiye' not in result_df.columns:
-                                result_df['Maslak Tedarikçi Bakiye'] = 0
-                            if 'İkitelli Tedarikçi Bakiye' not in result_df.columns:
-                                result_df['İkitelli Tedarikçi Bakiye'] = 0
-                            
-                            # Mann/Filtron verilerini işle
-                            brand_df_processed = brand_df.copy()
-                            
-                            # Material Adı kolonunu kontrol et (farklı isimler için)
-                            material_col = None
-                            for col_name in ['Material Adı', 'Material', 'Material Name', 'Ürün Kodu', 'Product Code', 'Material Kodu', 'Malzeme Kodu', 'Malzeme Adı']:
-                                if col_name in brand_df_processed.columns:
-                                    material_col = col_name
-                                    break
-                            
-
-                            
-                            # Debug: Tüm kolonları göster
-                            st.info(f"🔍 {brand} dosyasındaki tüm kolonlar:")
-                            for i, col in enumerate(brand_df_processed.columns):
-                                st.write(f"  {i+1}. {col}")
-                            
-                            # Önemli kolonları kontrol et
-                            important_cols = ['Müşteri SatınAlma No', 'Açık Sipariş Adedi', 'Material Kodu', 'Material Adı']
-                            st.info(f"🔍 {brand} önemli kolonlar kontrolü:")
-                            for col in important_cols:
-                                if col in brand_df_processed.columns:
-                                    st.success(f"  ✅ {col} - BULUNDU")
-                                else:
-                                    st.error(f"  ❌ {col} - BULUNAMADI")
-                            
-                            if material_col:
-                                # Material kodunu temizle
-                                brand_df_processed['Material_clean'] = brand_df_processed[material_col].astype(str).str.strip()
-                                
-                                # Debug: Material kolonu örnekleri göster
-                                st.info(f"🔍 {brand} Material kolonu örnekleri:")
-                                sample_materials = brand_df_processed[material_col].head(10).tolist()
-                                for i, material in enumerate(sample_materials):
-                                    st.write(f"  {i+1}. {material}")
-                                
-                                # Debug: Material_clean örnekleri göster
-                                st.info(f"🔍 {brand} Material_clean örnekleri:")
-                                sample_cleaned = brand_df_processed['Material_clean'].head(10).tolist()
-                                for i, cleaned in enumerate(sample_cleaned):
-                                    st.write(f"  {i+1}. {cleaned}")
-                                
-                                # Müşteri SatınAlma No kolonunu kontrol et
-                                if 'Müşteri SatınAlma No' in brand_df_processed.columns:
-                                    # Tedarikçi kodlarını belirle
-                                    brand_df_processed['Tedarikçi'] = brand_df_processed['Müşteri SatınAlma No'].astype(str).apply(
-                                        lambda x: 'Ankara' if 'AAS' in x
-                                        else 'İmes' if 'DAS' in x
-                                        else 'Bolu' if 'BAS' in x
-                                        else 'Maslak' if 'MAS' in x
-                                        else 'İkitelli' if 'EAS' in x
-                                        else 'Diğer'
-                                    )
-                                
-                                # Açık Sipariş Adedi kolonunu kontrol et
-                                if 'Açık Sipariş Adedi' in brand_df_processed.columns:
-                                    # Tedarikçi bazında grupla ve topla
-                                    for tedarikci in ['İmes', 'Ankara', 'Bolu', 'Maslak', 'İkitelli']:
-                                        tedarikci_data = brand_df_processed[brand_df_processed['Tedarikçi'] == tedarikci]
-                                        
-                                        if len(tedarikci_data) > 0:
-                                            # Material_clean bazında topla
-                                            grouped = tedarikci_data.groupby('Material_clean')['Açık Sipariş Adedi'].sum().reset_index()
-                                            
-                                            # Ana DataFrame ile eşleştir
-                                            for _, row in grouped.iterrows():
-                                                material_num = row['Material_clean']
-                                                quantity = row['Açık Sipariş Adedi']
-                                                
-                                                # Hem URUNKODU hem de Düzenlenmiş Ürün Kodu ile eşleştir
-                                                urunkodu_clean = result_df['URUNKODU'].astype(str).str.strip()
-                                                duzenlenmis_clean = result_df['Düzenlenmiş Ürün Kodu'].astype(str).str.replace(' ', '', regex=False)
-                                                material_clean_no_space = material_num.replace(' ', '')
-                                                
-                                                # İki farklı eşleştirme yöntemi dene
-                                                match_mask_urun = urunkodu_clean.str.contains(material_clean_no_space, case=False, na=False)
-                                                match_mask_duzen = duzenlenmis_clean.str.contains(material_clean_no_space, case=False, na=False)
-                                                match_mask = match_mask_urun | match_mask_duzen
-                                                
-                                                if match_mask.sum() > 0:
-                                                    # Tedarikçi kolonunu güncelle
-                                                    if tedarikci == 'İmes':
-                                                        result_df.loc[match_mask, 'İmes Tedarikçi Bakiye'] = quantity
-                                                    elif tedarikci == 'Ankara':
-                                                        result_df.loc[match_mask, 'Ankara Tedarikçi Bakiye'] = quantity
-                                                    elif tedarikci == 'Bolu':
-                                                        result_df.loc[match_mask, 'Bolu Tedarikçi Bakiye'] = quantity
-                                                    elif tedarikci == 'Maslak':
-                                                        result_df.loc[match_mask, 'Maslak Tedarikçi Bakiye'] = quantity
-                                                    elif tedarikci == 'İkitelli':
-                                                        result_df.loc[match_mask, 'İkitelli Tedarikçi Bakiye'] = quantity
-                                                    
-                                                    # Debug bilgisi
-                                                    st.info(f"🔍 {brand}: {material_num} → {match_mask.sum()} eşleşme bulundu")
-                                                else:
-                                                    # Eşleşme bulunamadığında debug bilgisi
-                                                    st.warning(f"⚠️ {brand}: {material_num} için eşleşme bulunamadı")
-                                
-                                st.success(f"✅ {brand} verileri işlendi: {len(brand_df_processed)} satır")
-                                
-                                # Debug: Sonuç kontrolü
-                                st.info(f"🔍 {brand} sonuç kontrolü:")
-                                for tedarikci in ['İmes', 'Ankara', 'Bolu', 'Maslak', 'İkitelli']:
-                                    col_name = f"{tedarikci} Tedarikçi Bakiye"
-                                    if col_name in result_df.columns:
-                                        total = result_df[col_name].sum()
-                                        st.write(f"  {tedarikci}: {total} adet")
-                            else:
-                                st.warning(f"⚠️ {brand} dosyasında gerekli kolonlar bulunamadı. Mevcut kolonlar: {list(brand_df_processed.columns)}")
-                                
-                        except Exception as e:
-                            st.error(f"❌ {brand} veri işleme hatası: {str(e)}")
         
         # Marka eşleştirme sonrası toplam depo bakiyesi güncelleme
         depo_bakiye_cols = ['Maslak Depo Bakiye', 'Bolu Depo Bakiye', 'İmes Depo Bakiye', 'Ankara Depo Bakiye', 'İkitelli Depo Bakiye']
@@ -1093,6 +1342,16 @@ def match_brands_parallel(main_df, uploaded_files):
             
             st.success(f"✅ Toplam Depo Bakiye hesaplandı: {len(available_depo_cols)} depo kolonu toplandı")
         
+        # Tedarikçi bakiye toplamlarını göster
+        tedarikci_cols = ['İmes Tedarikçi Bakiye', 'Ankara Tedarikçi Bakiye', 'Bolu Tedarikçi Bakiye', 'Maslak Tedarikçi Bakiye', 'İkitelli Tedarikçi Bakiye']
+        available_tedarikci_cols = [col for col in tedarikci_cols if col in result_df.columns]
+        
+        if available_tedarikci_cols:
+            st.info("🔍 Tedarikçi Bakiye Toplamları:")
+            for col in available_tedarikci_cols:
+                total = result_df[col].sum()
+                st.write(f"  {col}: {total:,.0f} adet")
+        
         return result_df
         
     except Exception as e:
@@ -1101,7 +1360,7 @@ def match_brands_parallel(main_df, uploaded_files):
 
 @st.cache_data(show_spinner="Excel oluşturuluyor...", ttl=1800)
 def format_excel_ultra_fast(df):
-    """Ultra hızlı Excel oluşturma - performans odaklı"""
+    """Excel oluşturma - performans odaklı"""
     try:
         output = BytesIO()
         
@@ -1262,7 +1521,7 @@ def main():
             with st.spinner("⚡ Dosya işleniyor..."):
                 # 1. Hızlı okuma
                 df = load_data_ultra_fast(uploaded_file)
-                st.success(f"✅ Yüklendi: {len(df):,} satır | {len(df.columns)} sütun")
+
                 
                 # 2. Hızlı dönüşüm
                 transformed_df = transform_data_ultra_fast(df)
@@ -1308,9 +1567,9 @@ def main():
     
     # 7 farklı Excel ekleme kutusu - hızlı yükleme
     st.header("📂 Ek Excel Dosyalarını Yükleme")
-    st.write("Aşağıdaki 7 Excel dosyasını yükleyin:")
+    st.write("Aşağıdaki 8 Excel dosyasını yükleyin:")
     
-    # 7 Excel dosyası yükleme - tek sütun
+    # 8 Excel dosyası yükleme - tek sütun
     excel1 = st.file_uploader("Schaeffler Luk", type=['xlsx', 'xls'], key="excel1")
     excel2 = st.file_uploader("ZF İthal Bakiye", type=['xlsx', 'xls'], key="excel2")
     excel3 = st.file_uploader("Delphi Bakiye", type=['xlsx', 'xls'], key="excel3")
@@ -1318,15 +1577,16 @@ def main():
     excel5 = st.file_uploader("Valeo Bakiye", type=['xlsx', 'xls'], key="excel5")
     excel6 = st.file_uploader("Filtron Bakiye", type=['xlsx', 'xls'], key="excel6")
     excel7 = st.file_uploader("Mann Bakiye", type=['xlsx', 'xls'], key="excel7")
+    excel8 = st.file_uploader("Bosch Bakiye", type=['xlsx', 'xls'], key="excel8")
     
     # Yükleme kontrolü
     uploaded_files = {
         'excel1': excel1, 'excel2': excel2, 'excel3': excel3, 'excel4': excel4,
-        'excel5': excel5, 'excel6': excel6, 'excel7': excel7
+        'excel5': excel5, 'excel6': excel6, 'excel7': excel7, 'excel8': excel8
     }
     uploaded_count = sum(1 for file in uploaded_files.values() if file is not None)
     
-    st.write(f"**Yüklenen dosya sayısı:** {uploaded_count}/7")
+    st.write(f"**Yüklenen dosya sayısı:** {uploaded_count}/8")
     
     # Güncelle butonu
     if uploaded_count > 0:
@@ -1336,7 +1596,7 @@ def main():
                     # Paralel marka eşleştirme işlemi
                     with st.spinner("⚡ Marka eşleştirme yapılıyor..."):
                         final_df = match_brands_parallel(st.session_state.processed_data, uploaded_files)
-                        st.success(f"✅ Ultra hızlı marka eşleştirme tamamlandı! {len(final_df)} satır işlendi.")
+
                     
                     # Final Excel indirme butonu
                     if len(final_df) > 0:
@@ -1375,42 +1635,23 @@ def main():
                         st.session_state.kerim_restarted = True
                         st.rerun()
     else:
-        st.info("Lütfen en az bir marka dosyası yükleyin.")
+        pass
     
-    # Ana sayfaya dönüş ve cache temizleme
+    # Cache temizleme
     st.markdown("---")
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        if st.button("🏠 Ana Sayfaya Dön", type="secondary"):
-            st.switch_page("Home")
-    
-    with col2:
-        if st.button("🧹 Cache Temizle", type="secondary"):
-            if clear_all_caches():
-                st.success("✅ Cache başarıyla temizlendi!")
-                st.session_state.app_restart_count += 1
-                st.rerun()
-            else:
-                st.error("❌ Cache temizleme başarısız!")
+    if st.button("🧹 Cache Temizle", type="secondary"):
+        if clear_all_caches():
+            st.success("✅ Cache başarıyla temizlendi!")
+            st.session_state.app_restart_count += 1
+            st.rerun()
+        else:
+            st.error("❌ Cache temizleme başarısız!")
 
 # Sidebar
 def sidebar():
-    st.sidebar.header("⚡ Maksimum Hız Modu")
+    st.sidebar.header("🛠️ Araçlar")
     
-    st.sidebar.success("""
-    **Aktif Optimizasyonlar:**
-    - Minimal dtype belirtme
-    - Vektörel işlemler
-    - Bellek optimizasyonu
-    - Paralel işleme
-    - Hızlı Excel oluşturma
-    """)
-    
-    # Cache durumu
-    st.sidebar.markdown("---")
-    st.sidebar.subheader("🧹 Cache Durumu")
-    
+    # Cache temizleme butonu
     if st.sidebar.button("Cache Temizle", type="secondary"):
         if clear_all_caches():
             st.sidebar.success("✅ Cache temizlendi!")
@@ -1418,18 +1659,11 @@ def sidebar():
         else:
             st.sidebar.error("❌ Cache temizleme başarısız!")
     
-    # Yeniden başlatma sayısı
-    restart_count = st.session_state.get('app_restart_count', 0)
-    st.sidebar.info(f"🔄 Yeniden başlatma sayısı: {restart_count}")
-    
-    st.sidebar.header("📋 Kurallar")
-    st.sidebar.write("- 0 değerleri → '-' olarak değiştirilir")
-    st.sidebar.write("- Depo önekleri yeni isimlere dönüştürülür")
-    st.sidebar.write("- Kategori sütunları korunur")
-    st.sidebar.write("- Vektörel işlemler ile hızlandırma")
-    
-    st.sidebar.header("ℹ️ Bilgi")
-    st.sidebar.write(f"Son Güncelleme: {datetime.datetime.now().strftime('%d.%m.%Y %H:%M')}")
+    st.sidebar.markdown("---")
+    st.sidebar.header("📋 Temel Kurallar")
+    st.sidebar.write("• Boş satırlara 0 değeri atanır")
+    st.sidebar.write("• Depo önekleri dönüştürülür")
+    st.sidebar.write("• Kategori sütunları korunur")
 
 if __name__ == "__main__":
     sidebar()
