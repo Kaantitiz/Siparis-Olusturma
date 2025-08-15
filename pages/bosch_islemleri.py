@@ -47,13 +47,13 @@ def determine_depot_code(siparis_notu):
     
     # Sipariş Notu'ndan ilk 3 karakteri al (depo kodu)
     if len(siparis_str) >= 3:
-        depo_kodu = siparis_str[:3].lower()  # Küçük harfe çevir
+        depo_kodu = siparis_str[:3].lower()  # Küçük harfe çevir (karşılaştırma için)
         
         # Sadece belirli depo kodlarını kabul et
         allowed_codes = ['aas', 'das', 'mas', 'bas', 'eas']
         
         if depo_kodu in allowed_codes:
-            return depo_kodu
+            return depo_kodu.upper()  # Büyük harfe çevir
         else:
             # Geçersiz depo kodu için boş string döndür
             return ""
