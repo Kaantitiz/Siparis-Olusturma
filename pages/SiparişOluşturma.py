@@ -31,79 +31,6 @@ def clear_all_caches():
         st.error(f"Cache temizleme hatası: {str(e)}")
         return False
 
-# PERFORMANS OPTİMİZASYONU FONKSİYONLARI
-@st.cache_data
-def optimize_dataframe_for_matching(df, cat4_column='CAT4', urunkodu_column='URUNKODU', duzenlenmis_column='Düzenlenmiş Ürün Kodu'):
-    """DataFrame'i eşleştirme için optimize et - cache'li"""
-    try:
-        # Sadece belirli markaları filtrele
-        brands = ['BOSCH', 'SCHAEFFLER', 'ZF', 'DELPHI', 'MANN', 'FILTRON']
-        optimized_dfs = {}
-        
-        for brand in brands:
-            brand_mask = df[cat4_column].str.contains(brand, case=False, na=False)
-            if brand_mask.sum() > 0:
-                brand_df = df[brand_mask].copy()
-                
-                # Ürün kodlarını önceden temizle
-                brand_df[f'{urunkodu_column}_Clean'] = brand_df[urunkodu_column].astype(str).str.strip().str.replace(' ', '', regex=False).str.upper()
-                brand_df[f'{duzenlenmis_column}_Clean'] = brand_df[duzenlenmis_column].astype(str).str.strip().str.replace(' ', '', regex=False).str.upper()
-                
-                # Index mapping oluştur
-                brand_df['Original_Index'] = brand_df.index
-                
-                optimized_dfs[brand] = brand_df
-                
-        return optimized_dfs
-        
-    except Exception as e:
-        st.error(f"DataFrame optimizasyon hatası: {str(e)}")
-        return {}
-
-def vectorized_matching(product_code, optimized_df, urunkodu_col='URUNKODU_Clean', duzenlenmis_col='Düzenlenmiş_Clean'):
-    """Vectorized eşleştirme - çok daha hızlı"""
-    try:
-        if not product_code or optimized_df.empty:
-            return pd.Series([False] * len(optimized_df))
-        
-        # Ürün kodunu temizle
-        clean_code = str(product_code).strip().replace(' ', '').upper()
-        
-        # Vectorized karşılaştırma
-        match_urun = optimized_df[urunkodu_col] == clean_code
-        match_duzen = optimized_df[duzenlenmis_col] == clean_code
-        
-        return match_urun | match_duzen
-        
-    except Exception as e:
-        st.error(f"Vectorized eşleştirme hatası: {str(e)}")
-        return pd.Series([False] * len(optimized_df))
-
-def batch_update_bakiye(result_df, matched_indices, depo_adi, bakiye_tipi, toplam_adet):
-    """Toplu bakiye güncelleme - optimize edilmiş"""
-    try:
-        # Depo mapping
-        depo_cols = {
-            'İmes': f'{depo_adi} {bakiye_tipi} Bakiye',
-            'Ankara': f'{depo_adi} {bakiye_tipi} Bakiye',
-            'Bolu': f'{depo_adi} {bakiye_tipi} Bakiye',
-            'Maslak': f'{depo_adi} {bakiye_tipi} Bakiye',
-            'İkitelli': f'{depo_adi} {bakiye_tipi} Bakiye'
-        }
-        
-        # Kolon adını oluştur
-        col_name = depo_cols.get(depo_adi, f'{depo_adi} {bakiye_tipi} Bakiye')
-        
-        if col_name in result_df.columns:
-            result_df.loc[matched_indices, col_name] += toplam_adet
-            return True
-        else:
-            return False
-            
-    except Exception as e:
-        st.error(f"Toplu bakiye güncelleme hatası: {str(e)}")
-        return False
-
 # Ürün kodu eşleştirme yardımcı fonksiyonları
 def clean_product_code(code):
     """Ürün kodunu temizle ve standardize et"""
@@ -564,20 +491,6 @@ def match_brands_parallel(main_df, uploaded_files):
             st.warning("CAT4 kolonu bulunamadı!")
             return main_df
         
-        # PERFORMANS OPTİMİZASYONU: Ana DataFrame'i önceden hazırla
-        st.info("🚀 DataFrame optimizasyonu yapılıyor...")
-        
-        # Tüm markalar için optimize edilmiş DataFrame'ler oluştur
-        optimized_dfs = optimize_dataframe_for_matching(main_df)
-        
-        # Tedarikçi bakiye kolonlarını önceden oluştur
-        tedarikci_cols = ['İmes Tedarikçi Bakiye', 'Ankara Tedarikçi Bakiye', 'Bolu Tedarikçi Bakiye', 
-                          'Maslak Tedarikçi Bakiye', 'İkitelli Tedarikçi Bakiye']
-        
-        for col in tedarikci_cols:
-            if col not in result_df.columns:
-                result_df[col] = 0
-        
         # Paralel işleme için marka verilerini topla
         brand_tasks = []
         for brand, excel_key in brand_excel_mapping.items():
@@ -595,8 +508,6 @@ def match_brands_parallel(main_df, uploaded_files):
             for future in as_completed(future_to_brand):
                 brand_name, brand_df = future.result()
                 brand_data[brand_name] = brand_df
-
-        st.success(f"✅ {len(brand_data)} marka verisi yüklendi")
 
         
         # Her marka için işlem yap
@@ -1184,148 +1095,114 @@ def match_brands_parallel(main_df, uploaded_files):
                         except Exception as e:
                             st.error(f"❌ Delphi veri işleme hatası: {str(e)}")
                 
-                    # Bosch için özel işleme mantığı - OPTİMİZE EDİLMİŞ
+                    # Bosch için özel işleme mantığı
                     elif 'BOSCH' in brand:
                         try:
-                            with st.spinner("🚀 Bosch eşleştirme optimize ediliyor..."):
-                                # Depo Bakiye ve Tedarikçi Bakiye kolonlarını oluştur
-                                depo_bakiye_cols = ['İmes Depo Bakiye', 'Ankara Depo Bakiye', 'Bolu Depo Bakiye', 'Maslak Depo Bakiye', 'İkitelli Depo Bakiye']
-                                tedarikci_bakiye_cols = ['İmes Tedarikçi Bakiye', 'Ankara Tedarikçi Bakiye', 'Bolu Tedarikçi Bakiye', 'Maslak Tedarikçi Bakiye', 'İkitelli Tedarikçi Bakiye']
+                            # Depo Bakiye ve Tedarikçi Bakiye kolonlarını oluştur
+                            depo_bakiye_cols = ['İmes Depo Bakiye', 'Ankara Depo Bakiye', 'Bolu Depo Bakiye', 'Maslak Depo Bakiye', 'İkitelli Depo Bakiye']
+                            tedarikci_bakiye_cols = ['İmes Tedarikçi Bakiye', 'Ankara Tedarikçi Bakiye', 'Bolu Tedarikçi Bakiye', 'Maslak Tedarikçi Bakiye', 'İkitelli Tedarikçi Bakiye']
+                            
+                            for col in depo_bakiye_cols:
+                                if col not in result_df.columns:
+                                    result_df[col] = 0
+                            
+                            for col in tedarikci_bakiye_cols:
+                                if col not in result_df.columns:
+                                    result_df[col] = 0
+                            
+                            # Bosch verilerini işle
+                            bosch_df = brand_df.copy()
+                            
+                            # Gerekli kolonları kontrol et
+                            required_cols = ['Depo Kodu', 'Ürün Grubu', 'Bosch No', 'Fatura ve Sevk Edilmemiş Toplam']
+                            missing_cols = [col for col in required_cols if col not in bosch_df.columns]
+                            
+                            if missing_cols:
+                                st.warning(f"⚠️ Bosch dosyasında eksik kolonlar: {missing_cols}")
+                                st.info(f"🔍 Mevcut kolonlar: {list(bosch_df.columns)}")
+                            else:
+                                # Depo Kodu kolonunu depo isimlerine çevir
+                                depo_mapping = {
+                                    'AAS': 'Ankara',
+                                    'BAS': 'Bolu', 
+                                    'DAS': 'İmes',
+                                    'EAS': 'İkitelli',
+                                    'MAS': 'Maslak'
+                                }
                                 
-                                for col in depo_bakiye_cols:
-                                    if col not in result_df.columns:
-                                        result_df[col] = 0
+                                bosch_df['Depo_Adi'] = bosch_df['Depo Kodu'].astype(str).map(depo_mapping)
                                 
-                                for col in tedarikci_bakiye_cols:
-                                    if col not in result_df.columns:
-                                        result_df[col] = 0
+                                # Ürün Grubu kolonunu kontrol et
+                                bosch_df['Bakiye_Tipi'] = bosch_df['Ürün Grubu'].astype(str).apply(
+                                    lambda x: 'Tedarikçi' if 'TEDARİKÇİ' in x.upper()
+                                    else 'Depo' if 'DEPO' in x.upper()
+                                    else 'Bilinmiyor'
+                                )
                                 
-                                # Bosch verilerini işle
-                                bosch_df = brand_df.copy()
+                                # Bosch No kolonunu temizle
+                                bosch_df['Bosch_No_Clean'] = bosch_df['Bosch No'].astype(str).str.strip()
                                 
-                                # Gerekli kolonları kontrol et
-                                required_cols = ['Depo Kodu', 'Ürün Grubu', 'Bosch No', 'Fatura ve Sevk Edilmemiş Toplam']
-                                missing_cols = [col for col in required_cols if col not in bosch_df.columns]
+                                # Fatura ve Sevk Edilmemiş Toplam kolonunu sayısal yap
+                                bosch_df['Toplam_Adet'] = pd.to_numeric(bosch_df['Fatura ve Sevk Edilmemiş Toplam'], errors='coerce').fillna(0)
                                 
-                                if missing_cols:
-                                    st.warning(f"⚠️ Bosch dosyasında eksik kolonlar: {missing_cols}")
-                                    st.info(f"🔍 Mevcut kolonlar: {list(bosch_df.columns)}")
-                                else:
-                                    # Depo Kodu kolonunu depo isimlerine çevir
-                                    depo_mapping = {
-                                        'AAS': 'Ankara',
-                                        'BAS': 'Bolu', 
-                                        'DAS': 'İmes',
-                                        'EAS': 'İkitelli',
-                                        'MAS': 'Maslak'
-                                    }
+                                # Aynı Ürün Grubu ve Depo Koduna sahip aynı Bosch No lu ürünlerde adetleri topla
+                                grouped_bosch = bosch_df.groupby(['Bosch_No_Clean', 'Depo_Adi', 'Bakiye_Tipi'])['Toplam_Adet'].sum().reset_index()
+                                
+                                # Ana DataFrame ile eşleştir
+                                for _, row in grouped_bosch.iterrows():
+                                    bosch_no = row['Bosch_No_Clean']
+                                    depo_adi = row['Depo_Adi']
+                                    bakiye_tipi = row['Bakiye_Tipi']
+                                    toplam_adet = row['Toplam_Adet']
                                     
-                                    bosch_df['Depo_Adi'] = bosch_df['Depo Kodu'].astype(str).map(depo_mapping)
-                                    
-                                    # Ürün Grubu kolonunu kontrol et
-                                    bosch_df['Bakiye_Tipi'] = bosch_df['Ürün Grubu'].astype(str).apply(
-                                        lambda x: 'Tedarikçi' if 'TEDARİKÇİ' in x.upper()
-                                        else 'Depo' if 'DEPO' in x.upper()
-                                        else 'Bilinmiyor'
-                                    )
-                                    
-                                    # Bosch No kolonunu temizle
-                                    bosch_df['Bosch_No_Clean'] = bosch_df['Bosch No'].astype(str).str.strip()
-                                    
-                                    # Fatura ve Sevk Edilmemiş Toplam kolonunu sayısal yap
-                                    bosch_df['Toplam_Adet'] = pd.to_numeric(bosch_df['Fatura ve Sevk Edilmemiş Toplam'], errors='coerce').fillna(0)
-                                    
-                                    # Aynı Ürün Grubu ve Depo Koduna sahip aynı Bosch No lu ürünlerde adetleri topla
-                                    grouped_bosch = bosch_df.groupby(['Bosch_No_Clean', 'Depo_Adi', 'Bakiye_Tipi'])['Toplam_Adet'].sum().reset_index()
-                                    
-                                    # PERFORMANS OPTİMİZASYONU: Ana DataFrame'i önceden hazırla
-                                    st.info("⚡ Performans optimizasyonu yapılıyor...")
-                                    
-                                    # Sadece BOSCH markalı ürünleri filtrele (bir kez)
+                                    # CAT4 kolonunda BOSCH markası ile eşleşen ürünleri bul
                                     bosch_mask = result_df['CAT4'].str.contains('BOSCH', case=False, na=False)
-                                    bosch_result_df = result_df[bosch_mask].copy()
                                     
-                                    if len(bosch_result_df) == 0:
-                                        st.warning("⚠️ Ana DataFrame'de BOSCH markalı ürün bulunamadı!")
-                                        return
+                                    # Bosch No ile eşleştir (hem URUNKODU hem de Düzenlenmiş Ürün Kodu ile)
+                                    urunkodu_clean = result_df['URUNKODU'].astype(str).str.strip().str.replace(' ', '', regex=False).str.upper()
+                                    duzenlenmis_clean = result_df['Düzenlenmiş Ürün Kodu'].astype(str).str.strip().str.replace(' ', '', regex=False).str.upper()
+                                    bosch_no_clean = bosch_no.replace(' ', '').upper()
                                     
-                                    # Ürün kodlarını önceden temizle (bir kez)
-                                    bosch_result_df['URUNKODU_Clean'] = bosch_result_df['URUNKODU'].astype(str).str.strip().str.replace(' ', '', regex=False).str.upper()
-                                    bosch_result_df['Düzenlenmiş_Clean'] = bosch_result_df['Düzenlenmiş Ürün Kodu'].astype(str).str.strip().str.replace(' ', '', regex=False).str.upper()
+                                    # Tam eşleştirme yap
+                                    match_mask_urun = urunkodu_clean == bosch_no_clean
+                                    match_mask_duzen = duzenlenmis_clean == bosch_no_clean
+                                    match_mask = (match_mask_urun | match_mask_duzen) & bosch_mask
                                     
-                                    # Index mapping oluştur
-                                    bosch_result_df['Original_Index'] = bosch_result_df.index
-                                    
-                                    # Eşleştirme işlemini optimize et
-                                    st.info(f"🔄 {len(grouped_bosch)} Bosch ürünü için eşleştirme yapılıyor...")
-                                    
-                                    # Progress bar ekle
-                                    progress_bar = st.progress(0)
-                                    progress_text = st.empty()
-                                    
-                                    for idx, row in enumerate(grouped_bosch.iterrows()):
-                                        _, data = row
-                                        bosch_no = data['Bosch_No_Clean']
-                                        depo_adi = data['Depo_Adi']
-                                        bakiye_tipi = data['Bakiye_Tipi']
-                                        toplam_adet = data['Toplam_Adet']
+                                    if match_mask.sum() > 0:
+                                        # Depo Bakiye veya Tedarikçi Bakiye kolonunu güncelle
+                                        if bakiye_tipi == 'Depo':
+                                            if depo_adi == 'İmes':
+                                                result_df.loc[match_mask, 'İmes Depo Bakiye'] += toplam_adet
+                                            elif depo_adi == 'Ankara':
+                                                result_df.loc[match_mask, 'Ankara Depo Bakiye'] += toplam_adet
+                                            elif depo_adi == 'Bolu':
+                                                result_df.loc[match_mask, 'Bolu Depo Bakiye'] += toplam_adet
+                                            elif depo_adi == 'Maslak':
+                                                result_df.loc[match_mask, 'Maslak Depo Bakiye'] += toplam_adet
+                                            elif depo_adi == 'İkitelli':
+                                                result_df.loc[match_mask, 'İkitelli Depo Bakiye'] += toplam_adet
                                         
-                                        # Progress güncelle
-                                        progress = (idx + 1) / len(grouped_bosch)
-                                        progress_bar.progress(progress)
-                                        progress_text.text(f"Eşleştiriliyor: {bosch_no} ({idx + 1}/{len(grouped_bosch)})")
+                                        elif bakiye_tipi == 'Tedarikçi':
+                                            if depo_adi == 'İmes':
+                                                result_df.loc[match_mask, 'İmes Tedarikçi Bakiye'] += toplam_adet
+                                            elif depo_adi == 'Ankara':
+                                                result_df.loc[match_mask, 'Ankara Tedarikçi Bakiye'] += toplam_adet
+                                            elif depo_adi == 'Bolu':
+                                                result_df.loc[match_mask, 'Bolu Tedarikçi Bakiye'] += toplam_adet
+                                            elif depo_adi == 'Maslak':
+                                                result_df.loc[match_mask, 'Maslak Tedarikçi Bakiye'] += toplam_adet
+                                            elif depo_adi == 'İkitelli':
+                                                result_df.loc[match_mask, 'İkitelli Tedarikçi Bakiye'] += toplam_adet
                                         
-                                        # Bosch No'yu temizle
-                                        bosch_no_clean = bosch_no.replace(' ', '').upper()
-                                        
-                                        # Vectorized eşleştirme (çok daha hızlı)
-                                        match_mask_urun = bosch_result_df['URUNKODU_Clean'] == bosch_no_clean
-                                        match_mask_duzen = bosch_result_df['Düzenlenmiş_Clean'] == bosch_no_clean
-                                        match_mask = match_mask_urun | match_mask_duzen
-                                        
-                                        if match_mask.sum() > 0:
-                                            # Eşleşen satırların orijinal index'lerini al
-                                            matched_indices = bosch_result_df.loc[match_mask, 'Original_Index']
-                                            
-                                            # Depo Bakiye veya Tedarikçi Bakiye kolonunu güncelle
-                                            if bakiye_tipi == 'Depo':
-                                                if depo_adi == 'İmes':
-                                                    result_df.loc[matched_indices, 'İmes Depo Bakiye'] += toplam_adet
-                                                elif depo_adi == 'Ankara':
-                                                    result_df.loc[matched_indices, 'Ankara Depo Bakiye'] += toplam_adet
-                                                elif depo_adi == 'Bolu':
-                                                    result_df.loc[matched_indices, 'Bolu Depo Bakiye'] += toplam_adet
-                                                elif depo_adi == 'Maslak':
-                                                    result_df.loc[matched_indices, 'Maslak Depo Bakiye'] += toplam_adet
-                                                elif depo_adi == 'İkitelli':
-                                                    result_df.loc[matched_indices, 'İkitelli Depo Bakiye'] += toplam_adet
-                                            
-                                            elif bakiye_tipi == 'Tedarikçi':
-                                                if depo_adi == 'İmes':
-                                                    result_df.loc[matched_indices, 'İmes Tedarikçi Bakiye'] += toplam_adet
-                                                elif depo_adi == 'Ankara':
-                                                    result_df.loc[matched_indices, 'Ankara Tedarikçi Bakiye'] += toplam_adet
-                                                elif depo_adi == 'Bolu':
-                                                    result_df.loc[matched_indices, 'Bolu Tedarikçi Bakiye'] += toplam_adet
-                                                elif depo_adi == 'Maslak':
-                                                    result_df.loc[matched_indices, 'Maslak Tedarikçi Bakiye'] += toplam_adet
-                                                elif depo_adi == 'İkitelli':
-                                                    result_df.loc[matched_indices, 'İkitelli Tedarikçi Bakiye'] += toplam_adet
-                                            
-                                            st.success(f"✅ Bosch eşleştirme: {bosch_no} → {depo_adi} {bakiye_tipi} → {toplam_adet} adet")
-                                        else:
-                                            st.warning(f"⚠️ Bosch eşleştirme bulunamadı: {bosch_no}")
-                                    
-                                    # Progress bar'ı temizle
-                                    progress_bar.empty()
-                                    progress_text.empty()
-                                    
-                                    # Bosch işleme özeti
-                                    total_bosch_products = len(grouped_bosch)
-                                    st.success(f"🎉 Bosch işleme tamamlandı: {total_bosch_products} ürün grubu işlendi")
-                                    st.info(f"📊 Kullanılan kolonlar: Depo Kodu, Ürün Grubu, Bosch No, Fatura ve Sevk Edilmemiş Toplam")
-                                    st.info(f"⚡ Performans: Vectorized eşleştirme ile %80+ hız artışı sağlandı")
-                                    
+                                        st.success(f"✅ Bosch eşleştirme: {bosch_no} → {depo_adi} {bakiye_tipi} → {toplam_adet} adet")
+                                    else:
+                                        st.warning(f"⚠️ Bosch eşleştirme bulunamadı: {bosch_no}")
+                                
+                                # Bosch işleme özeti
+                                total_bosch_products = len(grouped_bosch)
+                                st.info(f"🔍 Bosch işleme tamamlandı: {total_bosch_products} ürün grubu işlendi")
+                                st.info(f"📊 Kullanılan kolonlar: Depo Kodu, Ürün Grubu, Bosch No, Fatura ve Sevk Edilmemiş Toplam")
+                                
                         except Exception as e:
                             st.error(f"❌ Bosch veri işleme hatası: {str(e)}")
                             st.error(f"💡 Hata detayı: {e.__class__.__name__}")
