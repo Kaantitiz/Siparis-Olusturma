@@ -466,6 +466,130 @@ def transform_data_ultra_fast(df):
         st.error(f"Dönüşüm hatası: {str(e)}")
         return pd.DataFrame()
 
+@st.cache_data(show_spinner="Inbound verisi işleniyor...", ttl=3600)
+def process_inbound_data(main_df, inbound_file):
+    """Inbound Excel dosyasını işle ve depo bakiye kolonlarına ekle"""
+    try:
+        if inbound_file is None:
+            return main_df
+        
+        # Inbound dosyasını oku
+        inbound_df = pd.read_excel(inbound_file, engine='openpyxl')
+        
+        # Gerekli kolonları kontrol et
+        required_cols = ['Depo', 'Ürün Kodu', 'İrsaliye Miktarı']
+        missing_cols = [col for col in required_cols if col not in inbound_df.columns]
+        
+        if missing_cols:
+            st.warning(f"⚠️ Inbound dosyasında eksik kolonlar: {missing_cols}")
+            return main_df
+        
+        # Ana DataFrame'i kopyala
+        result_df = main_df.copy()
+        
+        # Depo bakiye kolonlarını oluştur (eğer yoksa)
+        depo_bakiye_cols = ['İmes Depo Bakiye', 'Ankara Depo Bakiye', 'Bolu Depo Bakiye', 'Maslak Depo Bakiye', 'İkitelli Depo Bakiye']
+        for col in depo_bakiye_cols:
+            if col not in result_df.columns:
+                result_df[col] = 0
+        
+        # Depo eşleştirme sözlüğü - Inbound dosyasındaki tam depo isimleri
+        depo_mapping = {
+            # TD kodları ile eşleştirme
+            'TD-02': 'Maslak',
+            'TD-04': 'Bolu', 
+            'TD-A01': 'Ankara',
+            'TD-A09': 'Ankara',
+            'TD-D01': 'İmes',
+            'TD-D05': 'İmes',
+            'TD-D09': 'İmes',
+            'TD-E01': 'İkitelli',
+            # Depo isimleri ile eşleştirme
+            'MASLAK': 'Maslak',
+            'BOLU': 'Bolu',
+            'ANKARA': 'Ankara',
+            'İMES': 'İmes',
+            'İKİTELLİ': 'İkitelli',
+            'IKITELLI': 'İkitelli',
+            # Kısa kodlar (eski sistem için)
+            'AAS': 'Ankara',
+            'DAS': 'İmes', 
+            'MAS': 'Maslak',
+            'BAS': 'Bolu',
+            'EAS': 'İkitelli'
+        }
+        
+        # Inbound verilerini işle
+        matched_depos = set()
+        total_rows = len(inbound_df)
+        processed_rows = 0
+        
+        for _, row in inbound_df.iterrows():
+            depo_kodu = str(row['Depo']).strip().upper()
+            urun_kodu = str(row['Ürün Kodu']).strip()
+            irsaliye_miktari = pd.to_numeric(row['İrsaliye Miktarı'], errors='coerce')
+            
+            if pd.isna(irsaliye_miktari) or irsaliye_miktari <= 0:
+                continue
+            
+            # Depo kodunu eşleştir - önce TD kodlarını kontrol et
+            depo_adi = None
+            
+            # TD kodlarını öncelikle kontrol et (daha spesifik)
+            for key, value in depo_mapping.items():
+                if key.startswith('TD-') and key in depo_kodu:
+                    depo_adi = value
+                    break
+            
+            # TD kodu bulunamazsa diğer eşleştirmeleri dene
+            if depo_adi is None:
+                for key, value in depo_mapping.items():
+                    if not key.startswith('TD-') and key in depo_kodu:
+                        depo_adi = value
+                        break
+            
+            if depo_adi is None:
+                continue
+            
+            # Eşleşen depo kodunu kaydet
+            matched_depos.add(f"{depo_kodu} → {depo_adi}")
+            
+            # Ürün kodu ile eşleştir (hem URUNKODU hem de Düzenlenmiş Ürün Kodu ile)
+            urunkodu_clean = result_df['URUNKODU'].astype(str).str.strip().str.replace(' ', '', regex=False).str.upper()
+            duzenlenmis_clean = result_df['Düzenlenmiş Ürün Kodu'].astype(str).str.strip().str.replace(' ', '', regex=False).str.upper()
+            urun_kodu_clean = urun_kodu.replace(' ', '').upper()
+            
+            # Tam eşleştirme yap
+            match_mask_urun = urunkodu_clean == urun_kodu_clean
+            match_mask_duzen = duzenlenmis_clean == urun_kodu_clean
+            match_mask = match_mask_urun | match_mask_duzen
+            
+            if match_mask.sum() > 0:
+                # İlgili depo bakiye kolonunu güncelle (toplama ile)
+                depo_bakiye_col = f"{depo_adi} Depo Bakiye"
+                if depo_bakiye_col in result_df.columns:
+                    result_df.loc[match_mask, depo_bakiye_col] += irsaliye_miktari
+                    processed_rows += 1
+        
+        # Toplam Depo Bakiye hesapla
+        if 'Toplam Depo Bakiye' in result_df.columns:
+            available_depo_cols = [col for col in depo_bakiye_cols if col in result_df.columns]
+            for col in available_depo_cols:
+                result_df[col] = pd.to_numeric(result_df[col], errors='coerce').fillna(0)
+            result_df['Toplam Depo Bakiye'] = result_df[available_depo_cols].sum(axis=1)
+        
+        # Debug bilgilerini göster
+        st.success(f"✅ Inbound verisi işlendi: {processed_rows}/{total_rows} satır işlendi")
+        
+        if matched_depos:
+            st.info(f"🔍 Eşleşen depo kodları: {', '.join(sorted(matched_depos))}")
+        
+        return result_df
+        
+    except Exception as e:
+        st.error(f"❌ Inbound veri işleme hatası: {str(e)}")
+        return main_df
+
 @st.cache_data(show_spinner="Marka eşleştirme yapılıyor...", ttl=3600)
 def match_brands_parallel(main_df, uploaded_files):
     """Paralel marka eşleştirme"""
@@ -1565,11 +1689,12 @@ def main():
             
             st.stop()
     
-    # 7 farklı Excel ekleme kutusu - hızlı yükleme
+    # 8 farklı Excel ekleme kutusu - hızlı yükleme
     st.header("📂 Ek Excel Dosyalarını Yükleme")
-    st.write("Aşağıdaki 8 Excel dosyasını yükleyin:")
+    st.write("Aşağıdaki 9 Excel dosyasını yükleyin:")
     
-    # 8 Excel dosyası yükleme - tek sütun
+    # 9 Excel dosyası yükleme - tek sütun
+    inbound_excel = st.file_uploader("Inbound", type=['xlsx', 'xls'], key="inbound_excel")
     excel1 = st.file_uploader("Schaeffler Luk", type=['xlsx', 'xls'], key="excel1")
     excel2 = st.file_uploader("ZF İthal Bakiye", type=['xlsx', 'xls'], key="excel2")
     excel3 = st.file_uploader("Delphi Bakiye", type=['xlsx', 'xls'], key="excel3")
@@ -1581,21 +1706,25 @@ def main():
     
     # Yükleme kontrolü
     uploaded_files = {
-        'excel1': excel1, 'excel2': excel2, 'excel3': excel3, 'excel4': excel4,
+        'inbound_excel': inbound_excel, 'excel1': excel1, 'excel2': excel2, 'excel3': excel3, 'excel4': excel4,
         'excel5': excel5, 'excel6': excel6, 'excel7': excel7, 'excel8': excel8
     }
     uploaded_count = sum(1 for file in uploaded_files.values() if file is not None)
     
-    st.write(f"**Yüklenen dosya sayısı:** {uploaded_count}/8")
+    st.write(f"**Yüklenen dosya sayısı:** {uploaded_count}/9")
     
     # Güncelle butonu
     if uploaded_count > 0:
         if st.button("🚀 Ultra Hızlı Marka Eşleştirme Yap", type="primary"):
             try:
                 if st.session_state.processed_data is not None:
-                    # Paralel marka eşleştirme işlemi
+                    # Önce Inbound verisini işle
+                    with st.spinner("⚡ Inbound verisi işleniyor..."):
+                        inbound_processed_df = process_inbound_data(st.session_state.processed_data, uploaded_files.get('inbound_excel'))
+                    
+                    # Sonra marka eşleştirme işlemi
                     with st.spinner("⚡ Marka eşleştirme yapılıyor..."):
-                        final_df = match_brands_parallel(st.session_state.processed_data, uploaded_files)
+                        final_df = match_brands_parallel(inbound_processed_df, uploaded_files)
 
                     
                     # Final Excel indirme butonu
@@ -1664,6 +1793,18 @@ def sidebar():
     st.sidebar.write("• Boş satırlara 0 değeri atanır")
     st.sidebar.write("• Depo önekleri dönüştürülür")
     st.sidebar.write("• Kategori sütunları korunur")
+    st.sidebar.write("• Inbound verisi depo bakiye kolonlarına eklenir")
+    
+    st.sidebar.markdown("---")
+    st.sidebar.header("📦 Inbound İşlemi")
+    st.sidebar.write("• Depo kolonundan depo eşleştirmesi")
+    st.sidebar.write("• Ürün Kodu ile ana dosya eşleştirmesi")
+    st.sidebar.write("• İrsaliye Miktarı depo bakiye kolonlarına eklenir")
+    st.sidebar.write("• Desteklenen depo kodları:")
+    st.sidebar.write("  - TD-02 (Maslak), TD-04 (Bolu)")
+    st.sidebar.write("  - TD-A01, TD-A09 (Ankara)")
+    st.sidebar.write("  - TD-D01, TD-D05, TD-D09 (İmes)")
+    st.sidebar.write("  - TD-E01 (İkitelli)")
 
 if __name__ == "__main__":
     sidebar()
